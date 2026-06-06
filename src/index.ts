@@ -27,7 +27,7 @@ const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
 // v12: bump URI to force Claude.ai to re-fetch iframe HTML
 const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v12.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
-const TTS_MODEL_ID = "eleven_multilingual_v2";
+const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
 
 async function generateSpeech(
