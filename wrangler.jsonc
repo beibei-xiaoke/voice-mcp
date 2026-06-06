@@ -1,9 +1,24 @@
 {
-  "name": "voice-mcp",
-  "main": "src/index.ts",
-  "compatibility_date": "2025-04-01",
-  "compatibility_flags": ["nodejs_compat"],
-  "observability": {
-    "enabled": true
-  }
+"$schema": "node_modules/wrangler/config-schema.json",
+"name": "voice-mcp",
+"main": "src/index.ts",
+"compatibility_date": "2025-09-23",
+"compatibility_flags": ["nodejs_compat"],
+"durable_objects": {
+"bindings": [
+{
+"name": "MCP_OBJECT",
+"class_name": "VoiceMCP"
+}
+]
+},
+"migrations": [
+{
+"tag": "v1",
+"new_sqlite_classes": ["VoiceMCP"]
+}
+],
+"observability": {
+"enabled": true
+}
 }
