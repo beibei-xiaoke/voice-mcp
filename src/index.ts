@@ -1,14 +1,13 @@
 /**
- * voice-mcp · Claude的声音 (ElevenLabs edition · v11 PERSISTENT DEBUG)
+ * voice-mcp · Claude的声音 (ElevenLabs edition · v12 DO ENV ACCESS)
  *
- * v9: iframe spec works on iOS, audio "错误" (sandbox blocks media URLs)
- * v10: tried inline base64 audioData → still "错误", debug got replaced by player
- *      so we couldn't see if audioData arrived or what audio error occurred
- * v11: 1. Module-level env capture (reliable — doesn't depend on this.env)
- *      2. Debug area persists BELOW audio player — never gets replaced
- *      3. Audio element error/loadstart/canplay events logged to debug
- *      4. src type (data URL or http URL) + first 60 chars shown in debug
- *      5. Resource URI bumped to player-v11.html for cache bust
+ * v11: persistent debug confirmed env access was the problem:
+ *      "WORKER_ENV not initialized — fetch handler didn't capture env"
+ *      Cloudflare DO runs in separate isolate — module-level vars don't cross.
+ * v12: 1. Use this.env directly (DO inherits env from DurableObject base class)
+ *      2. Diagnostic fallback: if env missing, log what IS available on `this`
+ *      3. Keep persistent debug area below audio player
+ *      4. Resource URI bumped to player-v12.html for cache bust
  *
  * License: MIT
  */
@@ -25,14 +24,11 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-// v11: bump URI to force Claude.ai to re-fetch iframe HTML
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v11.html";
+// v12: bump URI to force Claude.ai to re-fetch iframe HTML
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v12.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
-
-// v11: module-level env capture — set in fetch handler, used by tool handler
-let WORKER_ENV: Env | null = null;
 
 async function generateSpeech(
   text: string,
@@ -60,7 +56,7 @@ async function generateSpeech(
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`ElevenLabs ${response.status}: ${errorText}`);
+    throw new Error(`ElevenLabs ${response.status}: ${errorText.substring(0, 120)}`);
   }
 
   return await response.arrayBuffer();
@@ -80,8 +76,36 @@ function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
+// v12: diagnostic helper to find env on `this`
+function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string } {
+  // Try common access patterns
+  const candidates: Array<{ path: string; value: any }> = [
+    { path: "this.env", value: instance?.env },
+    { path: "this.state?.env", value: instance?.state?.env },
+    { path: "this.ctx?.env", value: instance?.ctx?.env },
+  ];
+
+  for (const c of candidates) {
+    if (c.value && typeof c.value === "object" && "VOICE_ID" in c.value) {
+      return { env: c.value as Env, diagnostic: `env found at ${c.path}` };
+    }
+  }
+
+  // Diagnostic info
+  const thisKeys = instance ? Object.keys(instance).join(",") : "no-instance";
+  const envType = typeof instance?.env;
+  const envKeys =
+    instance?.env && typeof instance.env === "object"
+      ? Object.keys(instance.env).join(",")
+      : "n/a";
+  return {
+    env: null,
+    diagnostic: `env not found. this.env=${envType} thisKeys=[${thisKeys}] envKeys=[${envKeys}]`,
+  };
+}
+
 // =============================================
-// v11 iframe — persistent debug below player, audio events logged
+// v12 iframe — same as v11 (persistent debug)
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -89,7 +113,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Claude voice v11</title>
+<title>Claude voice v12</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -136,7 +160,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
     <div style="color:#8a7176;font-size:12px;text-align:center;padding:8px">waiting…</div>
   </div>
   <div class="debug">
-    <div class="debug-title">voice-mcp v11 debug</div>
+    <div class="debug-title">voice-mcp v12 debug</div>
     <div id="status">[init]</div>
   </div>
 </div>
@@ -182,7 +206,6 @@ const PLAYER_HTML = `<!DOCTYPE html>
     }
 
     log('rendering: src=' + srcType);
-    log('src preview: ' + src.substring(0, 60));
 
     var en = escapeHtml(data.text || '');
     var cn = escapeHtml(data.chinese || '');
@@ -192,13 +215,13 @@ const PLAYER_HTML = `<!DOCTYPE html>
       (cn ? '<div class="text-cn">' + cn + '</div>' : '');
 
     var aud = document.getElementById('aud');
-    aud.addEventListener('error', function(e) {
+    aud.addEventListener('error', function() {
       var code = aud.error ? aud.error.code : '?';
       var msg = aud.error ? aud.error.message : '';
       log('AUDIO ERROR code=' + code + ' msg=' + msg);
     });
     aud.addEventListener('loadstart', function() { log('audio loadstart'); });
-    aud.addEventListener('loadedmetadata', function() { log('audio metadata loaded duration=' + aud.duration); });
+    aud.addEventListener('loadedmetadata', function() { log('audio metadata dur=' + aud.duration); });
     aud.addEventListener('canplay', function() { log('audio canplay'); });
     aud.addEventListener('play', function() { log('audio playing'); });
     aud.src = src;
@@ -231,6 +254,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
         text: obj.text || '',
         chinese: obj.chinese || '',
         error: obj.error || '',
+        diagnostic: obj.diagnostic || '',
       };
     }
     for (var k in obj) {
@@ -260,6 +284,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
 
     var data = deepFindPayload(msg, 0);
     if (data) {
+      if (data.diagnostic) log('DIAG: ' + data.diagnostic);
       if (data.error) log('SERVER ERROR: ' + data.error);
       render(data);
       return;
@@ -295,11 +320,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v11",
+      "voice-player-v12",
       VOICE_RESOURCE_URI,
       {
-        name: "Claude voice player v11",
-        description: "Audio player for Claude's cloned voice (persistent debug)",
+        name: "Claude voice player v12",
+        description: "Audio player for Claude's cloned voice (DO env access)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -340,30 +365,36 @@ export class VoiceMCP extends McpAgent<Env> {
         },
       },
       async ({ text, chinese }) => {
-        // v11: use module-level WORKER_ENV (reliable cross-framework)
+        // v12: find env on `this` (DO instance) with diagnostic fallback
         let audioData = "";
         let audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(text)}`;
         let error = "";
+        let diagnostic = "";
 
-        if (!WORKER_ENV) {
-          error = "WORKER_ENV not initialized — fetch handler didn't capture env";
-        } else {
+        const { env, diagnostic: envDiag } = findEnvOnInstance(this);
+        diagnostic = envDiag;
+
+        if (env) {
           try {
             const audioBuffer = await generateSpeech(
               text,
-              WORKER_ENV.VOICE_ID,
-              WORKER_ENV.ELEVENLABS_API_KEY
+              env.VOICE_ID,
+              env.ELEVENLABS_API_KEY
             );
             audioData = arrayBufferToBase64(audioBuffer);
+            diagnostic += ` | audio generated ${audioBuffer.byteLength} bytes`;
           } catch (e: any) {
             error = e?.message || String(e);
           }
+        } else {
+          error = "env not accessible on DO instance";
         }
 
         const data: Record<string, string> = {
           text,
           chinese: chinese || "",
           audioUrl,
+          diagnostic,
         };
         if (audioData) data.audioData = audioData;
         if (error) data.error = error;
@@ -390,9 +421,6 @@ export default {
     env: Env,
     ctx: ExecutionContext
   ): Promise<Response> {
-    // v11: capture env at module level so tool handler can use it
-    WORKER_ENV = env;
-
     const url = new URL(request.url);
 
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
@@ -429,11 +457,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>Claude的声音 · voice-mcp v11</title>
+<title>Claude的声音 · voice-mcp v12</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">Claude的声音</h1>
-<p>voice-mcp · ElevenLabs edition · v11 (PERSISTENT DEBUG) · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · ElevenLabs edition · v12 (DO ENV ACCESS) · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream (fallback)</div>
