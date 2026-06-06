@@ -452,6 +452,108 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, {
+        headers: {
+          "access-control-allow-origin": "*",
+          "access-control-allow-methods": "GET, POST, OPTIONS",
+          "access-control-allow-headers":
+            "Content-Type, Authorization, MCP-Protocol-Version",
+          "access-control-max-age": "86400",
+        },
+      });
+    }
+
+    // =============================================
+    // OAuth 2.1 endpoints (stub – auto-approves)
+    // Required by Claude.ai custom-connector flow
+    // =============================================
+
+    const oauthHeaders = {
+      "access-control-allow-origin": "*",
+      "content-type": "application/json",
+    };
+
+    // OAuth Authorization Server Metadata (RFC 8414)
+    if (
+      url.pathname === "/.well-known/oauth-authorization-server" ||
+      url.pathname === "/.well-known/oauth-protected-resource"
+    ) {
+      return new Response(
+        JSON.stringify({
+          issuer: url.origin,
+          authorization_endpoint: `${url.origin}/authorize`,
+          token_endpoint: `${url.origin}/token`,
+          registration_endpoint: `${url.origin}/register`,
+          response_types_supported: ["code"],
+          grant_types_supported: ["authorization_code", "refresh_token"],
+          code_challenge_methods_supported: ["S256", "plain"],
+          token_endpoint_auth_methods_supported: [
+            "none",
+            "client_secret_basic",
+            "client_secret_post",
+          ],
+          scopes_supported: ["mcp"],
+        }),
+        { headers: oauthHeaders }
+      );
+    }
+
+    // Dynamic Client Registration (RFC 7591)
+    if (url.pathname === "/register" && request.method === "POST") {
+      let body: any = {};
+      try {
+        body = await request.json();
+      } catch {}
+      return new Response(
+        JSON.stringify({
+          client_id:
+            "voice-mcp-" + Math.random().toString(36).slice(2, 10),
+          client_id_issued_at: Math.floor(Date.now() / 1000),
+          client_secret_expires_at: 0,
+          redirect_uris: body.redirect_uris ?? [],
+          grant_types: body.grant_types ?? ["authorization_code"],
+          response_types: body.response_types ?? ["code"],
+          token_endpoint_auth_method: "none",
+          client_name: body.client_name ?? "Claude",
+        }),
+        { headers: oauthHeaders }
+      );
+    }
+
+    // Authorization endpoint (auto-approve, redirects back with code)
+    if (url.pathname === "/authorize") {
+      const redirectUri = url.searchParams.get("redirect_uri");
+      const state = url.searchParams.get("state");
+      if (!redirectUri) {
+        return new Response("Missing redirect_uri", { status: 400 });
+      }
+      const code =
+        "code_" + Math.random().toString(36).slice(2) + "_" + Date.now();
+      const redirect = new URL(redirectUri);
+      redirect.searchParams.set("code", code);
+      if (state) redirect.searchParams.set("state", state);
+      return Response.redirect(redirect.toString(), 302);
+    }
+
+    // Token endpoint
+    if (url.pathname === "/token" && request.method === "POST") {
+      return new Response(
+        JSON.stringify({
+          access_token:
+            "public_" +
+            Math.random().toString(36).slice(2) +
+            "_" +
+            Date.now(),
+          token_type: "Bearer",
+          expires_in: 31536000,
+          scope: "mcp",
+        }),
+        { headers: oauthHeaders }
+      );
+    }
+
     // MCP endpoints (SSE + streamable)
     if (
       url.pathname === "/mcp" ||
