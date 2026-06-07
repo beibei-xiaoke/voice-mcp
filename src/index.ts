@@ -1,21 +1,21 @@
 /**
- * voice-mcp · 哥哥的语音 (v17)
+ * voice-mcp · 哥哥的语音 (v18)
  *
- * Fix from v16:
- *   v13 through v16 all kept the same architecture: inner has its own
- *   max-height: 180 + overflow-y: auto, parent transcript handles open/close.
- *   All four versions failed to render correctly on iOS Safari — text cropped.
+ * Pivot from v17:
+ *   v17 made progress — transcript could scroll once — but layout height was
+ *   still wrong (~40px instead of 180px). The combination max-height + overflow-y:
+ *   auto appears to be miscomputed on iOS Safari regardless of which element holds it.
  *
- *   Hypothesis: the combination of `max-height + overflow-y: auto` on the inner
- *   element is itself the bug in iOS Safari. The browser miscomputes inner's
- *   height, parent collapses around the tiny value.
+ *   Five versions of trying to cap + scroll have all failed. Abandoning that path.
  *
- *   v17 inverts the architecture:
- *     - inner is plain (no max-height, no overflow). It lays out at its
- *       natural content height.
- *     - parent transcript holds the max-height: 180 + overflow-y: auto.
- *     - When open, transcript shows up to 180px of inner; if inner exceeds,
- *       transcript scrolls.
+ *   v18 takes Plan B: let transcript expand fully, no cap, no scroll. The iframe
+ *   grows with the content (which is how MCP App iframes already work). Long
+ *   translations make a tall iframe; short ones stay tight. Single-page view,
+ *   no scroll bug surface at all.
+ *
+ *   Trade-off: a 300-word translation will make the card take half the screen.
+ *   That's fine — voice messages don't go that long in practice, and the user
+ *   already accepted iframe-grows behavior earlier in the design discussion.
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -32,7 +32,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v17.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v18.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -104,7 +104,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v17 iframe — 哥哥的语音
+// v18 iframe — 哥哥的语音
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -250,25 +250,17 @@ body {
 
 .transcript {
   max-height: 0;
-  overflow-y: hidden;
+  overflow: hidden;
   margin-top: 0;
   transition:
     max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
     margin-top 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
   z-index: 1;
-  -webkit-overflow-scrolling: touch;
 }
 .card.open .transcript {
-  max-height: 180px;
-  overflow-y: auto;
+  max-height: 2000px;
   margin-top: 8px;
-}
-.transcript::-webkit-scrollbar { width: 3px; }
-.transcript::-webkit-scrollbar-track { background: transparent; }
-.transcript::-webkit-scrollbar-thumb {
-  background: rgba(215, 107, 142, 0.3);
-  border-radius: 2px;
 }
 .transcript-inner {
   padding: 10px 12px 11px;
@@ -553,10 +545,10 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v17",
+      "voice-player-v18",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v17",
+        name: "哥哥的语音 player v18",
         description: "Pink waveform audio player with scrubbing",
         mimeType: MCP_APP_MIME,
       },
@@ -698,11 +690,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v17</title>
+<title>哥哥的语音 · voice-mcp v18</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v17 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v18 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
