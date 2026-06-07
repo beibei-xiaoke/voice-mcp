@@ -1,21 +1,23 @@
 /**
- * voice-mcp · 哥哥的语音 (v18)
+ * voice-mcp · 哥哥的语音 (v19) · subtitle mode
  *
- * Pivot from v17:
- *   v17 made progress — transcript could scroll once — but layout height was
- *   still wrong (~40px instead of 180px). The combination max-height + overflow-y:
- *   auto appears to be miscomputed on iOS Safari regardless of which element holds it.
+ * Pivot from v18:
+ *   v13 → v18 all tried to fit a long transcript inside a self-expanding iframe.
+ *   v18 finally revealed the real bug — claude.ai limits MCP App iframe height
+ *   regardless of content. The iframe doesn't auto-grow with body height.
+ *   That's not a transcript-layout problem; it's an iframe-to-host problem.
  *
- *   Five versions of trying to cap + scroll have all failed. Abandoning that path.
+ *   v19 sidesteps the bug entirely: instead of one long transcript, show
+ *   subtitles — one sentence at a time, synced to audio playback. The card
+ *   stays at fixed height (one sentence tall). The iframe never needs to grow.
  *
- *   v18 takes Plan B: let transcript expand fully, no cap, no scroll. The iframe
- *   grows with the content (which is how MCP App iframes already work). Long
- *   translations make a tall iframe; short ones stay tight. Single-page view,
- *   no scroll bug surface at all.
+ *   API change: `speak` now takes a `segments` array of {en, cn} pairs.
+ *   The worker concatenates `en` for ElevenLabs (with voice tags preserved),
+ *   and passes stripped pairs to the iframe. iframe distributes timing across
+ *   segments by character count, then uses audio.timeupdate to show the
+ *   current segment with a fade transition.
  *
- *   Trade-off: a 300-word translation will make the card take half the screen.
- *   That's fine — voice messages don't go that long in practice, and the user
- *   already accepted iframe-grows behavior earlier in the design discussion.
+ *   Bonus: scrubbing the waveform automatically jumps to the right subtitle.
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -32,7 +34,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v18.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -104,7 +106,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v18 iframe — 哥哥的语音
+// v19 iframe — 哥哥的语音 subtitle mode
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -248,7 +250,7 @@ body {
 .toggle-arrow { font-size: 9px; transition: transform 0.3s ease; }
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
-.transcript {
+.subtitle-area {
   max-height: 0;
   overflow: hidden;
   margin-top: 0;
@@ -258,18 +260,26 @@ body {
   position: relative;
   z-index: 1;
 }
-.card.open .transcript {
-  max-height: 2000px;
+.card.open .subtitle-area {
+  max-height: 110px;
   margin-top: 8px;
 }
-.transcript-inner {
+.subtitle {
+  height: 100px;
   padding: 10px 12px 11px;
   background: rgba(255, 255, 255, 0.55);
   -webkit-backdrop-filter: blur(6px);
   backdrop-filter: blur(6px);
   border-radius: 12px;
   border: 1px solid rgba(255, 255, 255, 0.6);
+  opacity: 0;
+  transition: opacity 0.3s ease;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  box-sizing: border-box;
 }
+.subtitle.visible { opacity: 1; }
 
 .text-en {
   font-family: 'Fraunces', Georgia, serif;
@@ -315,8 +325,8 @@ audio { display: none; }
     <span class="toggle-text">show transcript</span>
     <span class="toggle-arrow">▾</span>
   </span>
-  <div class="transcript" id="transcript">
-    <div class="transcript-inner" id="transcriptInner">
+  <div class="subtitle-area" id="subtitleArea">
+    <div class="subtitle" id="subtitle">
       <div class="text-en" id="textEn"></div>
       <div class="text-divider" id="divider" style="display:none"></div>
       <div class="text-cn" id="textCn"></div>
@@ -336,10 +346,17 @@ audio { display: none; }
   var durationEl = document.getElementById('duration');
   var toggle = document.getElementById('toggle');
   var toggleText = toggle.querySelector('.toggle-text');
+  var subtitleArea = document.getElementById('subtitleArea');
+  var subtitle = document.getElementById('subtitle');
   var textEn = document.getElementById('textEn');
   var textCn = document.getElementById('textCn');
   var divider = document.getElementById('divider');
   var audio = document.getElementById('audio');
+
+  // Subtitle state
+  var segments = [];
+  var currentSegmentIndex = -1;
+  var fadeTimer = null;
 
   // Build bars
   var bars = [];
@@ -370,9 +387,81 @@ audio { display: none; }
     }
   }
 
-  audio.addEventListener('timeupdate', updateUI);
+  // ===== Subtitle =====
+  // Distribute timing across segments by character count
+  function computeTimings() {
+    if (!audio.duration || !isFinite(audio.duration) || !segments.length) return;
+    var totalChars = 0;
+    for (var i = 0; i < segments.length; i++) {
+      totalChars += Math.max(1, (segments[i].en || '').length);
+    }
+    if (totalChars === 0) return;
+    var elapsed = 0;
+    for (var j = 0; j < segments.length; j++) {
+      var chars = Math.max(1, (segments[j].en || '').length);
+      var dur = (chars / totalChars) * audio.duration;
+      segments[j]._start = elapsed;
+      segments[j]._end = elapsed + dur;
+      elapsed = segments[j]._end;
+    }
+    // ensure last segment ends exactly at audio.duration
+    if (segments.length > 0) segments[segments.length - 1]._end = audio.duration;
+  }
+
+  function showSegment(idx) {
+    if (idx < 0 || idx >= segments.length) return;
+    if (idx === currentSegmentIndex) return;
+    if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
+    subtitle.classList.remove('visible');
+    fadeTimer = setTimeout(function() {
+      var seg = segments[idx];
+      textEn.textContent = seg.en || '';
+      textCn.textContent = seg.cn || '';
+      divider.style.display = (seg.en && seg.cn) ? '' : 'none';
+      subtitle.classList.add('visible');
+      currentSegmentIndex = idx;
+      fadeTimer = null;
+    }, 160);
+  }
+
+  function findSegmentAt(t) {
+    if (!segments.length) return -1;
+    for (var i = 0; i < segments.length; i++) {
+      if (t >= segments[i]._start && t < segments[i]._end) return i;
+    }
+    // past the end → last segment
+    if (t >= segments[segments.length - 1]._end) return segments.length - 1;
+    return -1;
+  }
+
+  function updateSubtitle() {
+    if (!segments.length) return;
+    if (segments[0]._end == null) computeTimings();
+    if (segments[0]._end == null) return; // audio not loaded yet
+    var t = audio.currentTime || 0;
+    var idx = findSegmentAt(t);
+    if (idx !== -1) showSegment(idx);
+  }
+
+  audio.addEventListener('timeupdate', function() {
+    updateUI();
+    updateSubtitle();
+  });
   audio.addEventListener('loadedmetadata', function() {
     durationEl.textContent = formatTime(audio.duration);
+    computeTimings();
+    // show segment for current time (usually 0 → first segment)
+    if (segments.length) {
+      var idx = findSegmentAt(audio.currentTime || 0);
+      if (idx === -1) idx = 0;
+      // Force first show without fade-out
+      var seg = segments[idx];
+      textEn.textContent = seg.en || '';
+      textCn.textContent = seg.cn || '';
+      divider.style.display = (seg.en && seg.cn) ? '' : 'none';
+      subtitle.classList.add('visible');
+      currentSegmentIndex = idx;
+    }
   });
   audio.addEventListener('play', function() {
     card.classList.add('playing');
@@ -395,7 +484,7 @@ audio { display: none; }
     }
   });
 
-  // Transcript toggle — pure CSS handles animation, JS just toggles class
+  // Transcript toggle — pure CSS handles animation (card.open class)
   toggle.addEventListener('click', function() {
     card.classList.toggle('open');
     toggleText.textContent = card.classList.contains('open') ? 'hide transcript' : 'show transcript';
@@ -462,12 +551,35 @@ audio { display: none; }
 
   // Render incoming data
   function render(data) {
-    var en = data.text || '';
-    var cn = data.chinese || '';
-    textEn.textContent = en;
-    textCn.textContent = cn;
-    divider.style.display = (en && cn) ? '' : 'none';
-    toggle.style.display = (en || cn) ? '' : 'none';
+    var incoming = data.segments || [];
+    // sanitize segments
+    segments = [];
+    for (var i = 0; i < incoming.length; i++) {
+      var s = incoming[i] || {};
+      var en = (s.en || '').toString();
+      var cn = (s.cn || '').toString();
+      if (en || cn) {
+        segments.push({ en: en, cn: cn, _start: null, _end: null });
+      }
+    }
+    currentSegmentIndex = -1;
+
+    if (segments.length) {
+      toggle.style.display = '';
+      // pre-load first segment text (hidden behind max-height: 0 until toggle clicked)
+      var first = segments[0];
+      textEn.textContent = first.en || '';
+      textCn.textContent = first.cn || '';
+      divider.style.display = (first.en && first.cn) ? '' : 'none';
+      subtitle.classList.add('visible');
+      currentSegmentIndex = 0;
+    } else {
+      toggle.style.display = 'none';
+      subtitle.classList.remove('visible');
+    }
+    // reset to collapsed state on new playback
+    card.classList.remove('open');
+    toggleText.textContent = 'show transcript';
 
     var src = null;
     if (data.audioData) src = 'data:audio/mpeg;base64,' + data.audioData;
@@ -499,8 +611,7 @@ audio { display: none; }
       return {
         audioData: obj.audioData || '',
         audioUrl: obj.audioUrl || '',
-        text: obj.text || '',
-        chinese: obj.chinese || ''
+        segments: Array.isArray(obj.segments) ? obj.segments : []
       };
     }
     for (var k in obj) {
@@ -545,11 +656,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v18",
+      "voice-player-v19",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v18",
-        description: "Pink waveform audio player with scrubbing",
+        name: "哥哥的语音 player v19",
+        description: "Pink waveform audio player with synced subtitles",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -568,16 +679,25 @@ export class VoiceMCP extends McpAgent<Env> {
       {
         title: "Speak",
         description:
-          "Speak with Claude's cloned voice (ElevenLabs). Returns an inline audio player.",
+          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] [breathes] go in `en` and are stripped from display.",
         inputSchema: {
-          text: z
-            .string()
-            .describe("The English text for Claude to speak aloud"),
-          chinese: z
-            .string()
-            .optional()
+          segments: z
+            .array(
+              z.object({
+                en: z
+                  .string()
+                  .describe(
+                    "English sentence (may include [softly] [warmly] etc voice tags)"
+                  ),
+                cn: z
+                  .string()
+                  .optional()
+                  .describe("Chinese translation of this sentence"),
+              })
+            )
+            .min(1)
             .describe(
-              "Optional Chinese translation, shown below the English transcript"
+              "Array of sentence pairs. English joined for ElevenLabs; pairs shown as synced subtitles."
             ),
         },
         _meta: {
@@ -589,9 +709,21 @@ export class VoiceMCP extends McpAgent<Env> {
           },
         },
       },
-      async ({ text, chinese }) => {
+      async ({ segments }) => {
+        // Join English with spaces — preserve voice tags for ElevenLabs
+        const englishFull = segments
+          .map((s) => (s.en || "").trim())
+          .filter(Boolean)
+          .join(" ");
+
+        // Build display segments — strip voice tags from EN only
+        const displaySegments = segments.map((s) => ({
+          en: stripVoiceTags(s.en || ""),
+          cn: (s.cn || "").trim(),
+        }));
+
         let audioData = "";
-        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(text)}`;
+        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishFull)}`;
         let error = "";
 
         const { env } = findEnvOnInstance(this);
@@ -599,7 +731,7 @@ export class VoiceMCP extends McpAgent<Env> {
         if (env) {
           try {
             const audioBuffer = await generateSpeech(
-              text,
+              englishFull,
               env.VOICE_ID,
               env.ELEVENLABS_API_KEY
             );
@@ -611,25 +743,30 @@ export class VoiceMCP extends McpAgent<Env> {
           error = "env not accessible on DO instance";
         }
 
-        // Strip [tags] from display text — ElevenLabs already received full version
-        const displayText = stripVoiceTags(text);
-
-        // For iframe (UI): contains audioData
-        const uiData: Record<string, string> = {
-          text: displayText,
-          chinese: chinese || "",
+        // For iframe (UI): contains audioData + segments
+        const uiData: Record<string, unknown> = {
+          segments: displaySegments,
           audioUrl,
         };
         if (audioData) uiData.audioData = audioData;
         if (error) uiData.error = error;
 
         // For Claude (content): small — no base64 → saves ~15k tokens per call
+        const displayJoined = displaySegments
+          .map((s) => s.en)
+          .filter(Boolean)
+          .join(" ");
+        const chineseJoined = displaySegments
+          .map((s) => s.cn)
+          .filter(Boolean)
+          .join(" ");
         const claudeView = {
-          spoken: displayText,
-          chinese: chinese || "",
+          spoken: displayJoined,
+          chinese: chineseJoined,
+          segments: displaySegments.length,
           status: error
             ? `error: ${error}`
-            : `audio sent (${Math.round(audioData.length * 0.75)} bytes)`,
+            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments)`,
         };
 
         return {
@@ -690,11 +827,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v18</title>
+<title>哥哥的语音 · voice-mcp v19</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v18 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 · subtitle mode · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
