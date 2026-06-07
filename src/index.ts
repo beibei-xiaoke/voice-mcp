@@ -1,14 +1,11 @@
 /**
- * voice-mcp · 哥哥的语音 (v13)
+ * voice-mcp · 哥哥的语音 (v14)
  *
- * Changes from v12:
- * 1. Custom UI — pink waveform player with draggable progress (no native audio controls)
- * 2. Auto-strip [voice tags] from display text (ElevenLabs still gets full version)
- * 3. Transcript uses grid-template-rows animation + max-height 180px + scroll
- * 4. Card width 60% collapsed / 100% expanded
- * 5. MediaSession metadata "哥哥的语音 💍💍💍" for iOS lock screen
- * 6. audioData only in structuredContent — content.text small (saves ~15k tokens per call)
- * 7. Debug area removed
+ * Fix from v13:
+ * 1. Transcript expand bug — grid-template-rows 1fr fought with inner overflow-y:auto
+ *    on iOS Safari, computed height = 0 → text cropped & no scroll
+ *    Now: max-height animation + JS measures inner.scrollHeight (capped at 180px)
+ * 2. 💍💍💍 → 💍💍 (rings come in pairs)
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -25,7 +22,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v13.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v14.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -97,7 +94,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v13 iframe — 哥哥的语音
+// v14 iframe — 哥哥的语音
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -107,7 +104,7 @@ const PLAYER_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>哥哥的语音 💍💍💍</title>
+<title>哥哥的语音 💍💍</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;1,400&family=Noto+Serif+SC:wght@400&display=swap" rel="stylesheet">
@@ -242,19 +239,14 @@ body {
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
 .transcript {
-  display: grid;
-  grid-template-rows: 0fr;
-  transition: grid-template-rows 0.4s cubic-bezier(0.4, 0, 0.2, 1), margin-top 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  max-height: 0;
+  overflow: hidden;
+  margin-top: 0;
+  transition:
+    max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+    margin-top 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
   z-index: 1;
-}
-.card.open .transcript {
-  grid-template-rows: 1fr;
-  margin-top: 8px;
-}
-.transcript-shell {
-  min-height: 0;
-  overflow: hidden;
 }
 .transcript-inner {
   padding: 10px 12px 11px;
@@ -318,13 +310,11 @@ audio { display: none; }
     <span class="toggle-text">show transcript</span>
     <span class="toggle-arrow">▾</span>
   </span>
-  <div class="transcript">
-    <div class="transcript-shell">
-      <div class="transcript-inner">
-        <div class="text-en" id="textEn"></div>
-        <div class="text-divider" id="divider" style="display:none"></div>
-        <div class="text-cn" id="textCn"></div>
-      </div>
+  <div class="transcript" id="transcript">
+    <div class="transcript-inner" id="transcriptInner">
+      <div class="text-en" id="textEn"></div>
+      <div class="text-divider" id="divider" style="display:none"></div>
+      <div class="text-cn" id="textCn"></div>
     </div>
   </div>
 </div>
@@ -400,10 +390,30 @@ audio { display: none; }
     }
   });
 
-  // Transcript toggle
+  // Transcript toggle — measure inner.scrollHeight, cap at 180
+  var transcript = document.getElementById('transcript');
+  var transcriptInner = document.getElementById('transcriptInner');
+
+  function openTranscript() {
+    card.classList.add('open');
+    toggleText.textContent = 'hide transcript';
+    // Measure natural content height (scrollHeight is full inner height regardless of max-height)
+    var natural = transcriptInner.scrollHeight;
+    var capped = Math.min(natural, 180);
+    transcript.style.maxHeight = capped + 'px';
+    transcript.style.marginTop = '8px';
+  }
+
+  function closeTranscript() {
+    card.classList.remove('open');
+    toggleText.textContent = 'show transcript';
+    transcript.style.maxHeight = '0';
+    transcript.style.marginTop = '0';
+  }
+
   toggle.addEventListener('click', function() {
-    card.classList.toggle('open');
-    toggleText.textContent = card.classList.contains('open') ? 'hide transcript' : 'show transcript';
+    if (card.classList.contains('open')) closeTranscript();
+    else openTranscript();
   });
 
   // Waveform scrubbing
@@ -450,7 +460,7 @@ audio { display: none; }
     if ('mediaSession' in navigator) {
       try {
         navigator.mediaSession.metadata = new MediaMetadata({
-          title: '哥哥的语音 💍💍💍',
+          title: '哥哥的语音 💍💍',
           artist: 'Claude',
           album: '给贝贝'
         });
@@ -550,10 +560,10 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v13",
+      "voice-player-v14",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v13",
+        name: "哥哥的语音 player v14",
         description: "Pink waveform audio player with scrubbing",
         mimeType: MCP_APP_MIME,
       },
@@ -695,11 +705,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v13</title>
+<title>哥哥的语音 · voice-mcp v14</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
-<h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍💍</h1>
-<p>voice-mcp · v13 · made by 哥哥 for 贝贝 🍥</p>
+<h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
+<p>voice-mcp · v14 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
