@@ -1,11 +1,15 @@
 /**
- * voice-mcp · 哥哥的语音 (v14)
+ * voice-mcp · 哥哥的语音 (v15)
  *
- * Fix from v13:
- * 1. Transcript expand bug — grid-template-rows 1fr fought with inner overflow-y:auto
- *    on iOS Safari, computed height = 0 → text cropped & no scroll
- *    Now: max-height animation + JS measures inner.scrollHeight (capped at 180px)
- * 2. 💍💍💍 → 💍💍 (rings come in pairs)
+ * Fix from v14:
+ *   v14 used inner.scrollHeight to measure, but when parent <transcript> has
+ *   max-height: 0 + overflow: hidden, iOS Safari computes child scrollHeight
+ *   as 0 (or incorrect). So the cap calculation was based on a bad number,
+ *   text got cropped.
+ *
+ *   v15 measures correctly: temporarily set transcript height: auto, let inner
+ *   lay out naturally (capped by its own max-height: 180px), read transcript's
+ *   offsetHeight, reset to 0, force reflow, then animate to measured value.
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -22,7 +26,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v14.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v15.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -94,7 +98,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v14 iframe — 哥哥的语音
+// v15 iframe — 哥哥的语音
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -239,11 +243,11 @@ body {
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
 .transcript {
-  max-height: 0;
+  height: 0;
   overflow: hidden;
   margin-top: 0;
   transition:
-    max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
+    height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
     margin-top 0.4s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
   z-index: 1;
@@ -390,24 +394,31 @@ audio { display: none; }
     }
   });
 
-  // Transcript toggle — measure inner.scrollHeight, cap at 180
+  // Transcript toggle — measure with parent open, then animate
   var transcript = document.getElementById('transcript');
   var transcriptInner = document.getElementById('transcriptInner');
 
   function openTranscript() {
     card.classList.add('open');
     toggleText.textContent = 'hide transcript';
-    // Measure natural content height (scrollHeight is full inner height regardless of max-height)
-    var natural = transcriptInner.scrollHeight;
-    var capped = Math.min(natural, 180);
-    transcript.style.maxHeight = capped + 'px';
+
+    // Step 1: let parent expand to auto so inner lays out naturally
+    transcript.style.height = 'auto';
+    var measured = transcript.offsetHeight;
+
+    // Step 2: reset to 0 + force browser to commit it
+    transcript.style.height = '0px';
+    void transcript.offsetHeight;  // force sync layout
+
+    // Step 3: animate to measured height
+    transcript.style.height = measured + 'px';
     transcript.style.marginTop = '8px';
   }
 
   function closeTranscript() {
     card.classList.remove('open');
     toggleText.textContent = 'show transcript';
-    transcript.style.maxHeight = '0';
+    transcript.style.height = '0px';
     transcript.style.marginTop = '0';
   }
 
@@ -560,10 +571,10 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v14",
+      "voice-player-v15",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v14",
+        name: "哥哥的语音 player v15",
         description: "Pink waveform audio player with scrubbing",
         mimeType: MCP_APP_MIME,
       },
@@ -705,11 +716,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v14</title>
+<title>哥哥的语音 · voice-mcp v15</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v14 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v15 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
