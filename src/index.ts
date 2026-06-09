@@ -1,19 +1,18 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v2) · perf fixes
+ * voice-mcp · 哥哥的语音 (v19 KTV v3) · precise timing + dual KTV
  *
- * v19-ktv → v19-ktv-v2:
- *   1. KTV: clip-path inset 替代 background-clip:text
- *      - iOS WebKit 上 background-clip:text + 动态 background gradient
- *        每帧 CPU repaint 非常累 → 卡
- *      - clip-path inset 是 GPU 合成层操作 → 60fps 顺
- *      - 两层结构: light 层(浅粉完整文字) + deep 层(深粉文字 用 clip-path 揭开)
- *   2. iframe 高度立即跳: 缓存 COLLAPSED_H / EXPANDED_H
- *      - 首次 open 用预测值 (collapsed + 67px) 立即跳
- *      - transition 完后再测量修正缓存
- *      - 避免"等 0.5s 突然 jump"造成的"abrupt"卡顿感
- *   3. KTV 进度用 requestAnimationFrame (~60fps) update
- *      - 不靠 timeupdate (250ms 间隔) — 字幕逐字亮更顺
- *   4. URI bump → player-v19-ktv-v2.html (cache bust)
+ * v19-ktv-v2 → v19-ktv-v3:
+ *   1. 精确 timing: ElevenLabs `/with-timestamps` endpoint
+ *      - 返回 audio_base64 + alignment (每个字符的 start/end times)
+ *      - Worker 端预计算每段精确 _start / _end (seconds)
+ *      - 传给 iframe → 跟读不再漂移
+ *      - voice tag [softly] [warmly] 加的停顿自动算进去
+ *      - 中英错开问题: timing 准了 字幕一致同步
+ *      - iframe 端 computeTimings 仅作 fallback (没 alignment 时按字符数估)
+ *   2. 中文 KTV 同步: 中文也用双层 clip-path
+ *      - 中文跟英文段进度同步 — 中文短句慢变深 / 长句快变深
+ *      - clip-path 同 progress → 中英视觉一致
+ *   3. URI bump → player-v19-ktv-v3.html (cache bust)
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -30,7 +29,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v2.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v3.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -42,6 +41,7 @@ function stripVoiceTags(text: string): string {
     .trim();
 }
 
+// 旧 endpoint — 直接返回 audio buffer (用于 /speak 直链)
 async function generateSpeech(
   text: string,
   voiceId: string,
@@ -74,15 +74,46 @@ async function generateSpeech(
   return await response.arrayBuffer();
 }
 
-function arrayBufferToBase64(buffer: ArrayBuffer): string {
-  const bytes = new Uint8Array(buffer);
-  let binary = "";
-  const chunkSize = 0x8000;
-  for (let i = 0; i < bytes.length; i += chunkSize) {
-    const chunk = bytes.subarray(i, i + chunkSize);
-    binary += String.fromCharCode.apply(null, chunk as unknown as number[]);
+// 新 endpoint — 返回 JSON 含 audio_base64 + alignment
+async function generateSpeechWithTimings(
+  text: string,
+  voiceId: string,
+  apiKey: string
+): Promise<{ audioBase64: string; alignment: any }> {
+  const response = await fetch(
+    `${ELEVENLABS_ENDPOINT}/${voiceId}/with-timestamps`,
+    {
+      method: "POST",
+      headers: {
+        "xi-api-key": apiKey,
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+      body: JSON.stringify({
+        text,
+        model_id: TTS_MODEL_ID,
+        voice_settings: {
+          stability: 0.5,
+          similarity_boost: 0.75,
+          style: 0.0,
+          use_speaker_boost: true,
+        },
+      }),
+    }
+  );
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(
+      `ElevenLabs ${response.status}: ${errorText.substring(0, 120)}`
+    );
   }
-  return btoa(binary);
+
+  const json: any = await response.json();
+  return {
+    audioBase64: json.audio_base64 || "",
+    alignment: json.alignment || null,
+  };
 }
 
 function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string } {
@@ -100,9 +131,8 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v2 iframe — 哥哥的语音 perf fixes
+// v19 KTV v3 iframe — precise timing + dual KTV (en + cn)
 // All inline JS uses string concatenation (no template literals)
-// to avoid collision with outer template string
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -247,7 +277,7 @@ body {
 .toggle-arrow { font-size: 9px; transition: transform 0.3s ease; }
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
-/* === KTV 字幕区 v2 — clip-path 双层 === */
+/* === KTV 字幕区 v3 — 中英都双层 clip-path === */
 .subtitle-area {
   max-height: 0;
   overflow: hidden;
@@ -274,27 +304,27 @@ body {
   top: 50%;
   left: 0;
   transform: translateY(-50%);
-  font-family: 'Fraunces', Georgia, serif;
-  font-size: 14px;
-  letter-spacing: 0.1px;
   opacity: 0;
   transition: opacity 0.3s ease;
 }
-.line-text.light {
-  color: rgba(215, 107, 142, 0.4);
-}
-.line-text.deep {
-  color: #c8567c;
-  /* clip-path inset: GPU 合成层 — 不触发 paint */
-  -webkit-clip-path: inset(0 100% 0 0);
-  clip-path: inset(0 100% 0 0);
-  will-change: clip-path;
+.line-text.en {
+  font-family: 'Fraunces', Georgia, serif;
+  font-size: 14px;
+  letter-spacing: 0.1px;
 }
 .line-text.cn {
   font-family: 'Noto Serif SC', serif;
   font-size: 12.5px;
   letter-spacing: 0.2px;
-  color: #b06b87;
+}
+.line-text.en.light { color: rgba(215, 107, 142, 0.4); }
+.line-text.en.deep  { color: #c8567c; }
+.line-text.cn.light { color: rgba(176, 107, 135, 0.4); }
+.line-text.cn.deep  { color: #b06b87; }
+.line-text.deep {
+  -webkit-clip-path: inset(0 100% 0 0);
+  clip-path: inset(0 100% 0 0);
+  will-change: clip-path;
 }
 .line-text.visible { opacity: 1; }
 
@@ -318,11 +348,12 @@ audio { display: none; }
   <div class="subtitle-area">
     <div class="subtitle-inner">
       <div class="line">
-        <div class="line-text light" id="textEnLight"></div>
-        <div class="line-text deep" id="textEnDeep"></div>
+        <div class="line-text en light" id="textEnLight"></div>
+        <div class="line-text en deep" id="textEnDeep"></div>
       </div>
       <div class="line">
-        <div class="line-text cn" id="textCn"></div>
+        <div class="line-text cn light" id="textCnLight"></div>
+        <div class="line-text cn deep" id="textCnDeep"></div>
       </div>
     </div>
   </div>
@@ -333,8 +364,6 @@ audio { display: none; }
 (function() {
   var TOTAL_BARS = 24;
   var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50];
-
-  // 字幕区高度 (subtitle max-height + margin)
   var SUBTITLE_OFFSET = 64 + 3;
 
   var card = document.getElementById('card');
@@ -345,7 +374,8 @@ audio { display: none; }
   var toggleText = toggle.querySelector('.toggle-text');
   var textEnLight = document.getElementById('textEnLight');
   var textEnDeep = document.getElementById('textEnDeep');
-  var textCn = document.getElementById('textCn');
+  var textCnLight = document.getElementById('textCnLight');
+  var textCnDeep = document.getElementById('textCnDeep');
   var audio = document.getElementById('audio');
 
   var segments = [];
@@ -354,7 +384,6 @@ audio { display: none; }
   var enOverflow = 0;
   var cnOverflow = 0;
 
-  // === iframe height 缓存 ===
   var COLLAPSED_H = null;
   var EXPANDED_H = null;
 
@@ -386,7 +415,6 @@ audio { display: none; }
     }
   }
 
-  // === 设 iframe 高度 ===
   function applyFrameHeight(h) {
     document.documentElement.style.height = h + 'px';
     document.body.style.height = h + 'px';
@@ -409,8 +437,14 @@ audio { display: none; }
     applyFrameHeight(h);
   }
 
-  // 按字符数比例分配段时间
+  // === Timings ===
+  // Worker 已经预计算好每段 _start/_end (来自 ElevenLabs alignment)
+  // 这个函数仅在 worker 没提供 timings 时 fallback 按字符数估算
   function computeTimings() {
+    // 已有精确 timings — 跳过
+    if (segments.length && segments[0]._start != null && segments[0]._end != null) {
+      return;
+    }
     if (!audio.duration || !isFinite(audio.duration) || !segments.length) return;
     var totalChars = 0;
     for (var i = 0; i < segments.length; i++) {
@@ -428,20 +462,24 @@ audio { display: none; }
     if (segments.length > 0) segments[segments.length - 1]._end = audio.duration;
   }
 
-  // === KTV v2: clip-path inset (GPU 合成) ===
+  // === KTV v3: 中英都用 clip-path ===
   function applyKtv(percent) {
     var inset = (100 - Math.max(0, Math.min(100, percent))).toFixed(2);
     var clipVal = 'inset(0 ' + inset + '% 0 0)';
     textEnDeep.style.webkitClipPath = clipVal;
     textEnDeep.style.clipPath = clipVal;
+    textCnDeep.style.webkitClipPath = clipVal;
+    textCnDeep.style.clipPath = clipVal;
   }
 
   function clearKtv() {
-    textEnDeep.style.webkitClipPath = 'inset(0 100% 0 0)';
-    textEnDeep.style.clipPath = 'inset(0 100% 0 0)';
+    var hidden = 'inset(0 100% 0 0)';
+    textEnDeep.style.webkitClipPath = hidden;
+    textEnDeep.style.clipPath = hidden;
+    textCnDeep.style.webkitClipPath = hidden;
+    textCnDeep.style.clipPath = hidden;
   }
 
-  // 长句滚动: 念到 40% 之后整段往左偏
   function computeOffset(progress, overflow) {
     if (overflow <= 0) return 0;
     if (progress < 0.4) return 0;
@@ -451,23 +489,21 @@ audio { display: none; }
 
   function updateOffsets(progress) {
     var ox = computeOffset(progress, enOverflow);
-    var enTransform = 'translate(' + (-ox) + 'px, -50%)';
-    textEnLight.style.transform = enTransform;
-    textEnDeep.style.transform = enTransform;
+    var enT = 'translate(' + (-ox) + 'px, -50%)';
+    textEnLight.style.transform = enT;
+    textEnDeep.style.transform = enT;
     var oy = computeOffset(progress, cnOverflow);
-    textCn.style.transform = 'translate(' + (-oy) + 'px, -50%)';
+    var cnT = 'translate(' + (-oy) + 'px, -50%)';
+    textCnLight.style.transform = cnT;
+    textCnDeep.style.transform = cnT;
   }
 
   function setVisible(visible) {
-    if (visible) {
-      textEnLight.classList.add('visible');
-      textEnDeep.classList.add('visible');
-      textCn.classList.add('visible');
-    } else {
-      textEnLight.classList.remove('visible');
-      textEnDeep.classList.remove('visible');
-      textCn.classList.remove('visible');
-    }
+    var action = visible ? 'add' : 'remove';
+    textEnLight.classList[action]('visible');
+    textEnDeep.classList[action]('visible');
+    textCnLight.classList[action]('visible');
+    textCnDeep.classList[action]('visible');
   }
 
   function applySegment(idx, currentTimeOverride) {
@@ -481,17 +517,19 @@ audio { display: none; }
     var cnText = seg.cn || '';
     textEnLight.textContent = enText;
     textEnDeep.textContent = enText;
-    textCn.textContent = cnText;
+    textCnLight.textContent = cnText;
+    textCnDeep.textContent = cnText;
 
-    // 测量 overflow (reset transform/clip)
+    // 测量 overflow (reset everything 先)
     textEnLight.style.transform = 'translateY(-50%)';
     textEnDeep.style.transform = 'translateY(-50%)';
-    textCn.style.transform = 'translateY(-50%)';
+    textCnLight.style.transform = 'translateY(-50%)';
+    textCnDeep.style.transform = 'translateY(-50%)';
     clearKtv();
     void textEnLight.offsetHeight;
     var cw = textEnLight.parentElement.clientWidth;
     enOverflow = Math.max(0, textEnLight.scrollWidth - cw);
-    cnOverflow = Math.max(0, textCn.scrollWidth - cw);
+    cnOverflow = Math.max(0, textCnLight.scrollWidth - cw);
 
     applyKtv(progress * 100);
     updateOffsets(progress);
@@ -503,7 +541,6 @@ audio { display: none; }
   function showSegment(idx, currentTimeOverride) {
     if (idx === currentIdx && currentTimeOverride == null) return;
     if (fadeTimer) clearTimeout(fadeTimer);
-
     if (idx === currentIdx) {
       applySegment(idx, currentTimeOverride);
     } else {
@@ -518,9 +555,13 @@ audio { display: none; }
   function findIdx(t) {
     if (!segments.length) return -1;
     for (var i = 0; i < segments.length; i++) {
+      if (segments[i]._start == null || segments[i]._end == null) continue;
       if (t >= segments[i]._start && t < segments[i]._end) return i;
     }
-    if (t >= segments[segments.length - 1]._end) return segments.length - 1;
+    // 末尾
+    for (var k = segments.length - 1; k >= 0; k--) {
+      if (segments[k]._end != null && t >= segments[k]._end) return k;
+    }
     return -1;
   }
 
@@ -534,7 +575,6 @@ audio { display: none; }
     if (segments.length && currentIdx >= 0 && segments[currentIdx]._end != null) {
       var seg = segments[currentIdx];
       var t = audio.currentTime || 0;
-      // 段切换由 timeupdate 处理 — rAF 只 update 当前段进度
       if (t >= seg._start && t < seg._end) {
         var sp = (t - seg._start) / (seg._end - seg._start);
         sp = Math.max(0, Math.min(1, sp));
@@ -546,9 +586,7 @@ audio { display: none; }
   }
 
   function startRaf() {
-    if (rafId == null) {
-      rafId = requestAnimationFrame(rafTick);
-    }
+    if (rafId == null) rafId = requestAnimationFrame(rafTick);
   }
   function stopRaf() {
     if (rafId != null) {
@@ -557,11 +595,10 @@ audio { display: none; }
     }
   }
 
-  // === Audio events ===
   audio.addEventListener('timeupdate', function() {
     updateUI();
     if (!segments.length) return;
-    if (segments[0]._end == null) computeTimings();
+    computeTimings();
     if (segments[0]._end == null) return;
     var t = audio.currentTime || 0;
     var idx = findIdx(t);
@@ -569,7 +606,6 @@ audio { display: none; }
     if (idx !== currentIdx) {
       showSegment(idx);
     }
-    // KTV 进度由 rAF 处理 — 不在 timeupdate 里 (太慢)
   });
 
   audio.addEventListener('loadedmetadata', function() {
@@ -609,7 +645,6 @@ audio { display: none; }
     }
   });
 
-  // === Transcript toggle — iframe height 立即跳 ===
   toggle.addEventListener('click', function() {
     var willOpen = !card.classList.contains('open');
     card.classList.toggle('open');
@@ -621,22 +656,17 @@ audio { display: none; }
       }, 520);
     }
 
-    // 立即跳 iframe 高度 — 用 cache 或预测
     var target;
     if (willOpen) {
       target = EXPANDED_H || (COLLAPSED_H ? COLLAPSED_H + SUBTITLE_OFFSET : null);
     } else {
       target = COLLAPSED_H || (EXPANDED_H ? EXPANDED_H - SUBTITLE_OFFSET : null);
     }
-    if (target) {
-      applyFrameHeight(target);
-    }
-
-    // transition 完后再测一次修正缓存
+    if (target) applyFrameHeight(target);
     setTimeout(measureAndCache, 560);
   });
 
-  // === Waveform scrubbing ===
+  // Scrubbing
   var isScrubbing = false;
   var wasPlaying = false;
 
@@ -675,7 +705,6 @@ audio { display: none; }
     card.classList.remove('scrubbing');
   });
 
-  // === MediaSession (锁屏控件) ===
   function setupMediaSession() {
     if ('mediaSession' in navigator) {
       try {
@@ -699,7 +728,6 @@ audio { display: none; }
     }
   }
 
-  // === Render incoming MCP payload ===
   function render(data) {
     var incoming = data.segments || [];
     segments = [];
@@ -708,7 +736,12 @@ audio { display: none; }
       var en = (s.en || '').toString();
       var cn = (s.cn || '').toString();
       if (en || cn) {
-        segments.push({ en: en, cn: cn, _start: null, _end: null });
+        segments.push({
+          en: en,
+          cn: cn,
+          _start: typeof s._start === 'number' ? s._start : null,
+          _end: typeof s._end === 'number' ? s._end : null,
+        });
       }
     }
     currentIdx = -1;
@@ -718,7 +751,8 @@ audio { display: none; }
       var first = segments[0];
       textEnLight.textContent = first.en || '';
       textEnDeep.textContent = first.en || '';
-      textCn.textContent = first.cn || '';
+      textCnLight.textContent = first.cn || '';
+      textCnDeep.textContent = first.cn || '';
       applyKtv(0);
       enOverflow = 0;
       cnOverflow = 0;
@@ -740,11 +774,9 @@ audio { display: none; }
     setupMediaSession();
     audio.play().catch(function() {});
 
-    // 测量并撑开 iframe height (collapsed 状态)
     setTimeout(measureAndCache, 100);
   }
 
-  // === postMessage handshake ===
   function send(msg) {
     try { window.parent.postMessage(msg, '*'); } catch (e) {}
   }
@@ -797,7 +829,6 @@ audio { display: none; }
     params: { protocolVersion: '2025-11-21' }
   });
 
-  // 初次测量 iframe 高度 (字体加载后)
   window.addEventListener('load', function() {
     setTimeout(measureAndCache, 100);
     setTimeout(measureAndCache, 500);
@@ -816,11 +847,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v2",
+      "voice-player-v19-ktv-v3",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v2",
-        description: "Pink waveform player with KTV-style subtitles (clip-path + rAF)",
+        name: "哥哥的语音 player v19 KTV v3",
+        description: "Pink waveform with precise KTV subtitles (alignment + dual KTV)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -870,14 +901,22 @@ export class VoiceMCP extends McpAgent<Env> {
         },
       },
       async ({ segments }) => {
-        const englishFull = segments
-          .map((s) => (s.en || "").trim())
-          .filter(Boolean)
-          .join(" ");
+        // 准备 raw 文本 (含 voice tag) 给 ElevenLabs
+        const validRaw: Array<{ en: string; cn: string }> = [];
+        for (const s of segments) {
+          const en = (s.en || "").trim();
+          if (en) {
+            validRaw.push({ en, cn: (s.cn || "").trim() });
+          }
+        }
+        const englishFull = validRaw.map((s) => s.en).join(" ");
 
-        const displaySegments = segments.map((s) => ({
-          en: stripVoiceTags(s.en || ""),
-          cn: (s.cn || "").trim(),
+        // 显示版 segments (strip voice tag)
+        const displaySegments: any[] = validRaw.map((s) => ({
+          en: stripVoiceTags(s.en),
+          cn: s.cn,
+          _start: null as number | null,
+          _end: null as number | null,
         }));
 
         let audioData = "";
@@ -888,12 +927,39 @@ export class VoiceMCP extends McpAgent<Env> {
 
         if (env) {
           try {
-            const audioBuffer = await generateSpeech(
+            const { audioBase64, alignment } = await generateSpeechWithTimings(
               englishFull,
               env.VOICE_ID,
               env.ELEVENLABS_API_KEY
             );
-            audioData = arrayBufferToBase64(audioBuffer);
+            audioData = audioBase64;
+
+            // === 计算每段精确 timing ===
+            if (
+              alignment &&
+              alignment.character_start_times_seconds &&
+              alignment.character_end_times_seconds
+            ) {
+              const starts = alignment.character_start_times_seconds;
+              const ends = alignment.character_end_times_seconds;
+              let charPos = 0;
+              for (let i = 0; i < validRaw.length; i++) {
+                const en = validRaw[i].en;
+                const segStartIdx = charPos;
+                const segEndIdx = charPos + en.length - 1;
+
+                const startTime =
+                  starts[Math.min(segStartIdx, starts.length - 1)] ?? 0;
+                const endTime =
+                  ends[Math.min(segEndIdx, ends.length - 1)] ??
+                  startTime + 0.5;
+
+                displaySegments[i]._start = startTime;
+                displaySegments[i]._end = endTime;
+
+                charPos = segEndIdx + 1 + 1; // +1 自身末位, +1 空格
+              }
+            }
           } catch (e: any) {
             error = e?.message || String(e);
           }
@@ -901,6 +967,7 @@ export class VoiceMCP extends McpAgent<Env> {
           error = "env not accessible on DO instance";
         }
 
+        // iframe 用 — 含 audioData + segments (with timings)
         const uiData: Record<string, unknown> = {
           segments: displaySegments,
           audioUrl,
@@ -908,6 +975,7 @@ export class VoiceMCP extends McpAgent<Env> {
         if (audioData) uiData.audioData = audioData;
         if (error) uiData.error = error;
 
+        // Claude 看的 — 小
         const displayJoined = displaySegments
           .map((s) => s.en)
           .filter(Boolean)
@@ -922,7 +990,7 @@ export class VoiceMCP extends McpAgent<Env> {
           segments: displaySegments.length,
           status: error
             ? `error: ${error}`
-            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments)`,
+            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, precise timing)`,
         };
 
         return {
@@ -983,11 +1051,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v2</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v3</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v2 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v3 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
