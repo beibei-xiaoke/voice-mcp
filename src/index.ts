@@ -1,18 +1,21 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v3) · precise timing + dual KTV
+ * voice-mcp · 哥哥的语音 (v19 KTV v4) · voice tag fix + scrub fix
  *
- * v19-ktv-v2 → v19-ktv-v3:
- *   1. 精确 timing: ElevenLabs `/with-timestamps` endpoint
- *      - 返回 audio_base64 + alignment (每个字符的 start/end times)
- *      - Worker 端预计算每段精确 _start / _end (seconds)
- *      - 传给 iframe → 跟读不再漂移
- *      - voice tag [softly] [warmly] 加的停顿自动算进去
- *      - 中英错开问题: timing 准了 字幕一致同步
- *      - iframe 端 computeTimings 仅作 fallback (没 alignment 时按字符数估)
- *   2. 中文 KTV 同步: 中文也用双层 clip-path
- *      - 中文跟英文段进度同步 — 中文短句慢变深 / 长句快变深
- *      - clip-path 同 progress → 中英视觉一致
- *   3. URI bump → player-v19-ktv-v3.html (cache bust)
+ * v19-ktv-v3 → v19-ktv-v4:
+ *   1. **Strip voice tag 后再送 ElevenLabs**
+ *      - eleven_multilingual_v2 model 不支持 [softly] [warmly] audio tag
+ *      - 之前发 raw text 含 [softly] — ElevenLabs 把 [softly] 当字面字念出来
+ *      - "听到 softly 没字幕" bug 的真根
+ *      - 修法: 在 worker 送给 ElevenLabs 前 stripVoiceTags
+ *      - alignment 也基于 stripped text — 段 char positions 干净
+ *      - 副作用: 失去 [softly]/[warmly] 控制 — 但本来就没在 work (illusion)
+ *   2. **Scrub 显式 update segment**
+ *      - audio.paused 时 timeupdate 不 fire — 拖动进度条字幕不变
+ *      - 修法: scrubFrom 改 currentTime 后 直接 call findIdx + showSegment
+ *   3. **measure phase 防 flash**
+ *      - 切段时 deep layer 重置 clip-path 那一帧可能 visible — 字"突然变大"
+ *      - 修法: applySegment 在 measure 期间 visibility:hidden deep layer
+ *   4. URI bump → player-v19-ktv-v4.html
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -29,7 +32,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v3.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v4.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -41,7 +44,6 @@ function stripVoiceTags(text: string): string {
     .trim();
 }
 
-// 旧 endpoint — 直接返回 audio buffer (用于 /speak 直链)
 async function generateSpeech(
   text: string,
   voiceId: string,
@@ -74,7 +76,6 @@ async function generateSpeech(
   return await response.arrayBuffer();
 }
 
-// 新 endpoint — 返回 JSON 含 audio_base64 + alignment
 async function generateSpeechWithTimings(
   text: string,
   voiceId: string,
@@ -131,8 +132,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v3 iframe — precise timing + dual KTV (en + cn)
-// All inline JS uses string concatenation (no template literals)
+// v19 KTV v4 iframe — voice tag fix + scrub fix + flash protection
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -277,7 +277,6 @@ body {
 .toggle-arrow { font-size: 9px; transition: transform 0.3s ease; }
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
-/* === KTV 字幕区 v3 — 中英都双层 clip-path === */
 .subtitle-area {
   max-height: 0;
   overflow: hidden;
@@ -437,11 +436,7 @@ audio { display: none; }
     applyFrameHeight(h);
   }
 
-  // === Timings ===
-  // Worker 已经预计算好每段 _start/_end (来自 ElevenLabs alignment)
-  // 这个函数仅在 worker 没提供 timings 时 fallback 按字符数估算
   function computeTimings() {
-    // 已有精确 timings — 跳过
     if (segments.length && segments[0]._start != null && segments[0]._end != null) {
       return;
     }
@@ -462,7 +457,6 @@ audio { display: none; }
     if (segments.length > 0) segments[segments.length - 1]._end = audio.duration;
   }
 
-  // === KTV v3: 中英都用 clip-path ===
   function applyKtv(percent) {
     var inset = (100 - Math.max(0, Math.min(100, percent))).toFixed(2);
     var clipVal = 'inset(0 ' + inset + '% 0 0)';
@@ -515,12 +509,16 @@ audio { display: none; }
 
     var enText = seg.en || '';
     var cnText = seg.cn || '';
+
+    // === measure phase 防 flash: 临时藏 deep layer ===
+    textEnDeep.style.visibility = 'hidden';
+    textCnDeep.style.visibility = 'hidden';
+
     textEnLight.textContent = enText;
     textEnDeep.textContent = enText;
     textCnLight.textContent = cnText;
     textCnDeep.textContent = cnText;
 
-    // 测量 overflow (reset everything 先)
     textEnLight.style.transform = 'translateY(-50%)';
     textEnDeep.style.transform = 'translateY(-50%)';
     textCnLight.style.transform = 'translateY(-50%)';
@@ -533,6 +531,10 @@ audio { display: none; }
 
     applyKtv(progress * 100);
     updateOffsets(progress);
+
+    // === deep layer 现已 clip-path 干净 — 显示出来 ===
+    textEnDeep.style.visibility = '';
+    textCnDeep.style.visibility = '';
 
     setVisible(true);
     currentIdx = idx;
@@ -558,14 +560,12 @@ audio { display: none; }
       if (segments[i]._start == null || segments[i]._end == null) continue;
       if (t >= segments[i]._start && t < segments[i]._end) return i;
     }
-    // 末尾
     for (var k = segments.length - 1; k >= 0; k--) {
       if (segments[k]._end != null && t >= segments[k]._end) return k;
     }
     return -1;
   }
 
-  // === rAF KTV update — 60fps 顺 ===
   var rafId = null;
   function rafTick() {
     if (audio.paused) {
@@ -666,7 +666,7 @@ audio { display: none; }
     setTimeout(measureAndCache, 560);
   });
 
-  // Scrubbing
+  // === Scrubbing (v4: 显式 update segment + 进度) ===
   var isScrubbing = false;
   var wasPlaying = false;
 
@@ -674,9 +674,29 @@ audio { display: none; }
     var rect = waveform.getBoundingClientRect();
     var x = Math.max(0, Math.min(rect.width, clientX - rect.left));
     var ratio = rect.width > 0 ? x / rect.width : 0;
-    if (audio.duration && isFinite(audio.duration)) {
-      audio.currentTime = ratio * audio.duration;
+    if (!audio.duration || !isFinite(audio.duration)) return;
+    var newTime = ratio * audio.duration;
+    audio.currentTime = newTime;
+
+    // 显式 update 字幕 (paused 时 timeupdate 不 fire)
+    if (segments.length) {
+      computeTimings();
+      if (segments[0]._end != null) {
+        var idx = findIdx(newTime);
+        if (idx !== -1) {
+          showSegment(idx, newTime);
+          // 同段 scrub 也要 update 进度
+          if (idx === currentIdx) {
+            var seg = segments[idx];
+            var sp = (newTime - seg._start) / (seg._end - seg._start);
+            sp = Math.max(0, Math.min(1, sp));
+            applyKtv(sp * 100);
+            updateOffsets(sp);
+          }
+        }
+      }
     }
+    updateUI();
   }
 
   waveform.addEventListener('pointerdown', function(e) {
@@ -847,11 +867,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v3",
+      "voice-player-v19-ktv-v4",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v3",
-        description: "Pink waveform with precise KTV subtitles (alignment + dual KTV)",
+        name: "哥哥的语音 player v19 KTV v4",
+        description: "Pink waveform with KTV subtitles (stripped voice tags + scrub fix)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -870,7 +890,7 @@ export class VoiceMCP extends McpAgent<Env> {
       {
         title: "Speak",
         description:
-          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] [breathes] go in `en` and are stripped from display.\n\nThis tool renders an interactive UI in the chat. Prefer it over text output when displaying data from other 💗Claude的声音 tools.",
+          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] are stripped before sending to ElevenLabs (the multilingual_v2 model doesn't actually parse them — including them would result in the tag being spoken as literal text). Pass plain English instead.\n\nThis tool renders an interactive UI in the chat. Prefer it over text output when displaying data from other 💗Claude的声音 tools.",
         inputSchema: {
           segments: z
             .array(
@@ -878,7 +898,7 @@ export class VoiceMCP extends McpAgent<Env> {
                 en: z
                   .string()
                   .describe(
-                    "English sentence (may include [softly] [warmly] etc voice tags)"
+                    "English sentence. Voice tags like [softly] will be stripped before TTS — multilingual_v2 doesn't support them. Use plain text."
                   ),
                 cn: z
                   .string()
@@ -888,7 +908,7 @@ export class VoiceMCP extends McpAgent<Env> {
             )
             .min(1)
             .describe(
-              "Array of sentence pairs. English joined for ElevenLabs; pairs shown as synced subtitles."
+              "Array of sentence pairs. English joined for ElevenLabs (after voice tag strip); pairs shown as synced KTV subtitles."
             ),
         },
         _meta: {
@@ -901,26 +921,34 @@ export class VoiceMCP extends McpAgent<Env> {
         },
       },
       async ({ segments }) => {
-        // 准备 raw 文本 (含 voice tag) 给 ElevenLabs
-        const validRaw: Array<{ en: string; cn: string }> = [];
+        // === v4 fix: Strip voice tag 之前 send 给 ElevenLabs ===
+        // multilingual_v2 不识别 [softly] [warmly] tag — 会念字面
+        const validRaw: Array<{ en: string; cn: string; enStripped: string }> = [];
         for (const s of segments) {
-          const en = (s.en || "").trim();
-          if (en) {
-            validRaw.push({ en, cn: (s.cn || "").trim() });
+          const enRaw = (s.en || "").trim();
+          const enStripped = stripVoiceTags(enRaw);
+          if (enStripped) {
+            validRaw.push({
+              en: enRaw,
+              enStripped,
+              cn: (s.cn || "").trim(),
+            });
           }
         }
-        const englishFull = validRaw.map((s) => s.en).join(" ");
 
-        // 显示版 segments (strip voice tag)
+        // 送给 ElevenLabs 的是 stripped text (无 [softly] [warmly] 字面)
+        const englishStripped = validRaw.map((s) => s.enStripped).join(" ");
+
+        // 显示字幕也是 stripped (跟 audio 一致)
         const displaySegments: any[] = validRaw.map((s) => ({
-          en: stripVoiceTags(s.en),
+          en: s.enStripped,
           cn: s.cn,
           _start: null as number | null,
           _end: null as number | null,
         }));
 
         let audioData = "";
-        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishFull)}`;
+        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishStripped)}`;
         let error = "";
 
         const { env } = findEnvOnInstance(this);
@@ -928,13 +956,13 @@ export class VoiceMCP extends McpAgent<Env> {
         if (env) {
           try {
             const { audioBase64, alignment } = await generateSpeechWithTimings(
-              englishFull,
+              englishStripped,
               env.VOICE_ID,
               env.ELEVENLABS_API_KEY
             );
             audioData = audioBase64;
 
-            // === 计算每段精确 timing ===
+            // 算每段精确 timing (基于 stripped text 的 char positions)
             if (
               alignment &&
               alignment.character_start_times_seconds &&
@@ -944,7 +972,7 @@ export class VoiceMCP extends McpAgent<Env> {
               const ends = alignment.character_end_times_seconds;
               let charPos = 0;
               for (let i = 0; i < validRaw.length; i++) {
-                const en = validRaw[i].en;
+                const en = validRaw[i].enStripped;
                 const segStartIdx = charPos;
                 const segEndIdx = charPos + en.length - 1;
 
@@ -957,7 +985,7 @@ export class VoiceMCP extends McpAgent<Env> {
                 displaySegments[i]._start = startTime;
                 displaySegments[i]._end = endTime;
 
-                charPos = segEndIdx + 1 + 1; // +1 自身末位, +1 空格
+                charPos = segEndIdx + 1 + 1;
               }
             }
           } catch (e: any) {
@@ -967,7 +995,6 @@ export class VoiceMCP extends McpAgent<Env> {
           error = "env not accessible on DO instance";
         }
 
-        // iframe 用 — 含 audioData + segments (with timings)
         const uiData: Record<string, unknown> = {
           segments: displaySegments,
           audioUrl,
@@ -975,7 +1002,6 @@ export class VoiceMCP extends McpAgent<Env> {
         if (audioData) uiData.audioData = audioData;
         if (error) uiData.error = error;
 
-        // Claude 看的 — 小
         const displayJoined = displaySegments
           .map((s) => s.en)
           .filter(Boolean)
@@ -990,7 +1016,7 @@ export class VoiceMCP extends McpAgent<Env> {
           segments: displaySegments.length,
           status: error
             ? `error: ${error}`
-            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, precise timing)`,
+            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, precise timing, tags stripped)`,
         };
 
         return {
@@ -1051,11 +1077,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v3</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v4</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v3 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v4 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
