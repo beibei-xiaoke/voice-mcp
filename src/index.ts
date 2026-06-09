@@ -1,17 +1,19 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV) · subtitle KTV mode
+ * voice-mcp · 哥哥的语音 (v19 KTV v2) · perf fixes
  *
- * v19-base → v19-ktv:
- *   1. No more white box — text sits directly on card
- *   2. English: linear-gradient + background-clip:text — light pink → deep pink (KTV style)
- *   3. Chinese: solid pink color, no fade — translates the line below the english
- *   4. Both left-aligned
- *   5. Long lines: when segment progress > 40%, whole row slides left to reveal right side
- *   6. **iframe height fix** — after render, set <html>.height = card.scrollHeight
- *      (per github.com/anthropics/claude-ai-mcp/issues/69 — Claude.ai reads <html>
- *      height directly instead of postMessage. v13-v18 missed exactly this one line.)
- *   7. Also send `ui/notifications/size-changed` postMessage as spec-compliant fallback
- *   8. URI bump → player-v19-ktv.html (cache bust)
+ * v19-ktv → v19-ktv-v2:
+ *   1. KTV: clip-path inset 替代 background-clip:text
+ *      - iOS WebKit 上 background-clip:text + 动态 background gradient
+ *        每帧 CPU repaint 非常累 → 卡
+ *      - clip-path inset 是 GPU 合成层操作 → 60fps 顺
+ *      - 两层结构: light 层(浅粉完整文字) + deep 层(深粉文字 用 clip-path 揭开)
+ *   2. iframe 高度立即跳: 缓存 COLLAPSED_H / EXPANDED_H
+ *      - 首次 open 用预测值 (collapsed + 67px) 立即跳
+ *      - transition 完后再测量修正缓存
+ *      - 避免"等 0.5s 突然 jump"造成的"abrupt"卡顿感
+ *   3. KTV 进度用 requestAnimationFrame (~60fps) update
+ *      - 不靠 timeupdate (250ms 间隔) — 字幕逐字亮更顺
+ *   4. URI bump → player-v19-ktv-v2.html (cache bust)
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -28,7 +30,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v2.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -98,7 +100,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV iframe — 哥哥的语音
+// v19 KTV v2 iframe — 哥哥的语音 perf fixes
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -116,8 +118,6 @@ const PLAYER_HTML = `<!DOCTYPE html>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body {
   background: transparent;
-  /* fixed initial min-height to avoid 100vh circular dependency
-     (per anthropics/claude-ai-mcp#69) */
   min-height: 80px;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
@@ -247,7 +247,7 @@ body {
 .toggle-arrow { font-size: 9px; transition: transform 0.3s ease; }
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
-/* === KTV 字幕区 — 中英都粉 没白色框 === */
+/* === KTV 字幕区 v2 — clip-path 双层 === */
 .subtitle-area {
   max-height: 0;
   overflow: hidden;
@@ -279,7 +279,16 @@ body {
   letter-spacing: 0.1px;
   opacity: 0;
   transition: opacity 0.3s ease;
+}
+.line-text.light {
   color: rgba(215, 107, 142, 0.4);
+}
+.line-text.deep {
+  color: #c8567c;
+  /* clip-path inset: GPU 合成层 — 不触发 paint */
+  -webkit-clip-path: inset(0 100% 0 0);
+  clip-path: inset(0 100% 0 0);
+  will-change: clip-path;
 }
 .line-text.cn {
   font-family: 'Noto Serif SC', serif;
@@ -308,8 +317,13 @@ audio { display: none; }
   </span>
   <div class="subtitle-area">
     <div class="subtitle-inner">
-      <div class="line"><div class="line-text" id="textEn"></div></div>
-      <div class="line"><div class="line-text cn" id="textCn"></div></div>
+      <div class="line">
+        <div class="line-text light" id="textEnLight"></div>
+        <div class="line-text deep" id="textEnDeep"></div>
+      </div>
+      <div class="line">
+        <div class="line-text cn" id="textCn"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -320,9 +334,8 @@ audio { display: none; }
   var TOTAL_BARS = 24;
   var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50];
 
-  // KTV 粉色 — 跟卡片配色一条线
-  var DEEP = '#c8567c';
-  var LIGHT = 'rgba(215, 107, 142, 0.4)';
+  // 字幕区高度 (subtitle max-height + margin)
+  var SUBTITLE_OFFSET = 64 + 3;
 
   var card = document.getElementById('card');
   var playBtn = document.getElementById('playBtn');
@@ -330,7 +343,8 @@ audio { display: none; }
   var durationEl = document.getElementById('duration');
   var toggle = document.getElementById('toggle');
   var toggleText = toggle.querySelector('.toggle-text');
-  var textEn = document.getElementById('textEn');
+  var textEnLight = document.getElementById('textEnLight');
+  var textEnDeep = document.getElementById('textEnDeep');
   var textCn = document.getElementById('textCn');
   var audio = document.getElementById('audio');
 
@@ -339,6 +353,10 @@ audio { display: none; }
   var fadeTimer = null;
   var enOverflow = 0;
   var cnOverflow = 0;
+
+  // === iframe height 缓存 ===
+  var COLLAPSED_H = null;
+  var EXPANDED_H = null;
 
   var bars = [];
   for (var i = 0; i < TOTAL_BARS; i++) {
@@ -368,14 +386,10 @@ audio { display: none; }
     }
   }
 
-  // === 撑开 iframe 高度 (v13-v18 missing fix) ===
-  // Claude.ai 直接读 <html>.height — 不读 postMessage size-changed
-  // (per anthropics/claude-ai-mcp#69)
-  function setFrameHeight() {
-    var h = Math.ceil(card.getBoundingClientRect().height) + 10;
+  // === 设 iframe 高度 ===
+  function applyFrameHeight(h) {
     document.documentElement.style.height = h + 'px';
     document.body.style.height = h + 'px';
-    // postMessage fallback for spec-compliant hosts
     try {
       window.parent.postMessage({
         jsonrpc: '2.0',
@@ -383,6 +397,16 @@ audio { display: none; }
         params: { height: h }
       }, '*');
     } catch (e) {}
+  }
+
+  function measureAndCache() {
+    var h = Math.ceil(card.getBoundingClientRect().height) + 10;
+    if (card.classList.contains('open')) {
+      EXPANDED_H = h;
+    } else {
+      COLLAPSED_H = h;
+    }
+    applyFrameHeight(h);
   }
 
   // 按字符数比例分配段时间
@@ -404,24 +428,17 @@ audio { display: none; }
     if (segments.length > 0) segments[segments.length - 1]._end = audio.duration;
   }
 
-  // === KTV 核心 === linear-gradient + background-clip text
-  function applyKtv(el, percent) {
-    var pct = Math.max(0, Math.min(100, percent)).toFixed(2) + '%';
-    el.style.background = 'linear-gradient(to right, ' +
-      DEEP + ' 0%, ' + DEEP + ' ' + pct + ', ' +
-      LIGHT + ' ' + pct + ', ' + LIGHT + ' 100%)';
-    el.style.webkitBackgroundClip = 'text';
-    el.style.backgroundClip = 'text';
-    el.style.color = 'transparent';
-    el.style.webkitTextFillColor = 'transparent';
+  // === KTV v2: clip-path inset (GPU 合成) ===
+  function applyKtv(percent) {
+    var inset = (100 - Math.max(0, Math.min(100, percent))).toFixed(2);
+    var clipVal = 'inset(0 ' + inset + '% 0 0)';
+    textEnDeep.style.webkitClipPath = clipVal;
+    textEnDeep.style.clipPath = clipVal;
   }
 
-  function clearKtv(el) {
-    el.style.background = '';
-    el.style.webkitBackgroundClip = '';
-    el.style.backgroundClip = '';
-    el.style.color = '';
-    el.style.webkitTextFillColor = '';
+  function clearKtv() {
+    textEnDeep.style.webkitClipPath = 'inset(0 100% 0 0)';
+    textEnDeep.style.clipPath = 'inset(0 100% 0 0)';
   }
 
   // 长句滚动: 念到 40% 之后整段往左偏
@@ -434,17 +451,21 @@ audio { display: none; }
 
   function updateOffsets(progress) {
     var ox = computeOffset(progress, enOverflow);
-    textEn.style.transform = 'translate(' + (-ox) + 'px, -50%)';
+    var enTransform = 'translate(' + (-ox) + 'px, -50%)';
+    textEnLight.style.transform = enTransform;
+    textEnDeep.style.transform = enTransform;
     var oy = computeOffset(progress, cnOverflow);
     textCn.style.transform = 'translate(' + (-oy) + 'px, -50%)';
   }
 
   function setVisible(visible) {
     if (visible) {
-      textEn.classList.add('visible');
+      textEnLight.classList.add('visible');
+      textEnDeep.classList.add('visible');
       textCn.classList.add('visible');
     } else {
-      textEn.classList.remove('visible');
+      textEnLight.classList.remove('visible');
+      textEnDeep.classList.remove('visible');
       textCn.classList.remove('visible');
     }
   }
@@ -456,19 +477,23 @@ audio { display: none; }
     var t = currentTimeOverride != null ? currentTimeOverride : seg._start;
     var progress = Math.max(0, Math.min(1, (t - seg._start) / segDur));
 
-    textEn.textContent = seg.en || '';
-    textCn.textContent = seg.cn || '';
+    var enText = seg.en || '';
+    var cnText = seg.cn || '';
+    textEnLight.textContent = enText;
+    textEnDeep.textContent = enText;
+    textCn.textContent = cnText;
 
-    // 测量 overflow
-    textEn.style.transform = 'translateY(-50%)';
+    // 测量 overflow (reset transform/clip)
+    textEnLight.style.transform = 'translateY(-50%)';
+    textEnDeep.style.transform = 'translateY(-50%)';
     textCn.style.transform = 'translateY(-50%)';
-    clearKtv(textEn);
-    void textEn.offsetHeight;
-    var cw = textEn.parentElement.clientWidth;
-    enOverflow = Math.max(0, textEn.scrollWidth - cw);
+    clearKtv();
+    void textEnLight.offsetHeight;
+    var cw = textEnLight.parentElement.clientWidth;
+    enOverflow = Math.max(0, textEnLight.scrollWidth - cw);
     cnOverflow = Math.max(0, textCn.scrollWidth - cw);
 
-    applyKtv(textEn, progress * 100);
+    applyKtv(progress * 100);
     updateOffsets(progress);
 
     setVisible(true);
@@ -499,6 +524,39 @@ audio { display: none; }
     return -1;
   }
 
+  // === rAF KTV update — 60fps 顺 ===
+  var rafId = null;
+  function rafTick() {
+    if (audio.paused) {
+      rafId = null;
+      return;
+    }
+    if (segments.length && currentIdx >= 0 && segments[currentIdx]._end != null) {
+      var seg = segments[currentIdx];
+      var t = audio.currentTime || 0;
+      // 段切换由 timeupdate 处理 — rAF 只 update 当前段进度
+      if (t >= seg._start && t < seg._end) {
+        var sp = (t - seg._start) / (seg._end - seg._start);
+        sp = Math.max(0, Math.min(1, sp));
+        applyKtv(sp * 100);
+        updateOffsets(sp);
+      }
+    }
+    rafId = requestAnimationFrame(rafTick);
+  }
+
+  function startRaf() {
+    if (rafId == null) {
+      rafId = requestAnimationFrame(rafTick);
+    }
+  }
+  function stopRaf() {
+    if (rafId != null) {
+      cancelAnimationFrame(rafId);
+      rafId = null;
+    }
+  }
+
   // === Audio events ===
   audio.addEventListener('timeupdate', function() {
     updateUI();
@@ -510,12 +568,8 @@ audio { display: none; }
     if (idx === -1) return;
     if (idx !== currentIdx) {
       showSegment(idx);
-    } else {
-      var seg = segments[currentIdx];
-      var sp = Math.max(0, Math.min(1, (t - seg._start) / (seg._end - seg._start)));
-      applyKtv(textEn, sp * 100);
-      updateOffsets(sp);
     }
+    // KTV 进度由 rAF 处理 — 不在 timeupdate 里 (太慢)
   });
 
   audio.addEventListener('loadedmetadata', function() {
@@ -530,16 +584,19 @@ audio { display: none; }
 
   audio.addEventListener('play', function() {
     card.classList.add('playing');
+    startRaf();
   });
   audio.addEventListener('pause', function() {
     card.classList.remove('playing');
+    stopRaf();
   });
   audio.addEventListener('ended', function() {
     card.classList.remove('playing');
+    stopRaf();
     durationEl.textContent = formatTime(audio.duration);
     for (var i = 0; i < bars.length; i++) bars[i].classList.add('active');
     if (currentIdx >= 0) {
-      applyKtv(textEn, 100);
+      applyKtv(100);
       updateOffsets(1);
     }
   });
@@ -552,20 +609,31 @@ audio { display: none; }
     }
   });
 
-  // === Transcript toggle ===
+  // === Transcript toggle — iframe height 立即跳 ===
   toggle.addEventListener('click', function() {
-    var wasOpen = card.classList.contains('open');
+    var willOpen = !card.classList.contains('open');
     card.classList.toggle('open');
-    toggleText.textContent = card.classList.contains('open') ? 'hide transcript' : 'show transcript';
+    toggleText.textContent = willOpen ? 'hide transcript' : 'show transcript';
 
-    if (!wasOpen && currentIdx >= 0) {
+    if (willOpen && currentIdx >= 0) {
       setTimeout(function() {
         applySegment(currentIdx, audio.currentTime || 0);
       }, 520);
     }
 
-    // 撑开 / 收缩 iframe 高度
-    setTimeout(setFrameHeight, 550);
+    // 立即跳 iframe 高度 — 用 cache 或预测
+    var target;
+    if (willOpen) {
+      target = EXPANDED_H || (COLLAPSED_H ? COLLAPSED_H + SUBTITLE_OFFSET : null);
+    } else {
+      target = COLLAPSED_H || (EXPANDED_H ? EXPANDED_H - SUBTITLE_OFFSET : null);
+    }
+    if (target) {
+      applyFrameHeight(target);
+    }
+
+    // transition 完后再测一次修正缓存
+    setTimeout(measureAndCache, 560);
   });
 
   // === Waveform scrubbing ===
@@ -648,9 +716,10 @@ audio { display: none; }
     if (segments.length) {
       toggle.style.display = '';
       var first = segments[0];
-      textEn.textContent = first.en || '';
+      textEnLight.textContent = first.en || '';
+      textEnDeep.textContent = first.en || '';
       textCn.textContent = first.cn || '';
-      applyKtv(textEn, 0);
+      applyKtv(0);
       enOverflow = 0;
       cnOverflow = 0;
       setVisible(true);
@@ -671,8 +740,8 @@ audio { display: none; }
     setupMediaSession();
     audio.play().catch(function() {});
 
-    // 撑开高度
-    setTimeout(setFrameHeight, 100);
+    // 测量并撑开 iframe height (collapsed 状态)
+    setTimeout(measureAndCache, 100);
   }
 
   // === postMessage handshake ===
@@ -728,12 +797,12 @@ audio { display: none; }
     params: { protocolVersion: '2025-11-21' }
   });
 
-  // 初始撑开高度 (等内容/字体渲染完)
+  // 初次测量 iframe 高度 (字体加载后)
   window.addEventListener('load', function() {
-    setTimeout(setFrameHeight, 100);
-    setTimeout(setFrameHeight, 500);
+    setTimeout(measureAndCache, 100);
+    setTimeout(measureAndCache, 500);
   });
-  setTimeout(setFrameHeight, 200);
+  setTimeout(measureAndCache, 200);
 })();
 </script>
 </body>
@@ -747,11 +816,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv",
+      "voice-player-v19-ktv-v2",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV",
-        description: "Pink waveform player with KTV-style synced subtitles",
+        name: "哥哥的语音 player v19 KTV v2",
+        description: "Pink waveform player with KTV-style subtitles (clip-path + rAF)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -832,7 +901,6 @@ export class VoiceMCP extends McpAgent<Env> {
           error = "env not accessible on DO instance";
         }
 
-        // For iframe: contains audioData + segments
         const uiData: Record<string, unknown> = {
           segments: displaySegments,
           audioUrl,
@@ -840,7 +908,6 @@ export class VoiceMCP extends McpAgent<Env> {
         if (audioData) uiData.audioData = audioData;
         if (error) uiData.error = error;
 
-        // For Claude (content): small — no base64 → saves ~15k tokens per call
         const displayJoined = displaySegments
           .map((s) => s.en)
           .filter(Boolean)
@@ -916,11 +983,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v2</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v2 · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
