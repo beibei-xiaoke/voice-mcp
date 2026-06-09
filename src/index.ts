@@ -1,23 +1,17 @@
 /**
- * voice-mcp · 哥哥的语音 (v19) · subtitle mode
+ * voice-mcp · 哥哥的语音 (v19 KTV) · subtitle KTV mode
  *
- * Pivot from v18:
- *   v13 → v18 all tried to fit a long transcript inside a self-expanding iframe.
- *   v18 finally revealed the real bug — claude.ai limits MCP App iframe height
- *   regardless of content. The iframe doesn't auto-grow with body height.
- *   That's not a transcript-layout problem; it's an iframe-to-host problem.
- *
- *   v19 sidesteps the bug entirely: instead of one long transcript, show
- *   subtitles — one sentence at a time, synced to audio playback. The card
- *   stays at fixed height (one sentence tall). The iframe never needs to grow.
- *
- *   API change: `speak` now takes a `segments` array of {en, cn} pairs.
- *   The worker concatenates `en` for ElevenLabs (with voice tags preserved),
- *   and passes stripped pairs to the iframe. iframe distributes timing across
- *   segments by character count, then uses audio.timeupdate to show the
- *   current segment with a fade transition.
- *
- *   Bonus: scrubbing the waveform automatically jumps to the right subtitle.
+ * v19-base → v19-ktv:
+ *   1. No more white box — text sits directly on card
+ *   2. English: linear-gradient + background-clip:text — light pink → deep pink (KTV style)
+ *   3. Chinese: solid pink color, no fade — translates the line below the english
+ *   4. Both left-aligned
+ *   5. Long lines: when segment progress > 40%, whole row slides left to reveal right side
+ *   6. **iframe height fix** — after render, set <html>.height = card.scrollHeight
+ *      (per github.com/anthropics/claude-ai-mcp/issues/69 — Claude.ai reads <html>
+ *      height directly instead of postMessage. v13-v18 missed exactly this one line.)
+ *   7. Also send `ui/notifications/size-changed` postMessage as spec-compliant fallback
+ *   8. URI bump → player-v19-ktv.html (cache bust)
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -34,13 +28,11 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_multilingual_v2";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
 
-// Strip [softly] [warmly] [breathes] etc from display text
-// ElevenLabs still gets the full version for voice control
 function stripVoiceTags(text: string): string {
   return text
     .replace(/\s*\[[^\]]+\]\s*/g, " ")
@@ -106,7 +98,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 iframe — 哥哥的语音 subtitle mode
+// v19 KTV iframe — 哥哥的语音
 // All inline JS uses string concatenation (no template literals)
 // to avoid collision with outer template string
 // =============================================
@@ -115,24 +107,29 @@ const PLAYER_HTML = `<!DOCTYPE html>
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>哥哥的语音 💍💍</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;1,400&family=Noto+Serif+SC:wght@400&display=swap" rel="stylesheet">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
-body {
-  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+html, body {
   background: transparent;
-  padding: 5px;
+  /* fixed initial min-height to avoid 100vh circular dependency
+     (per anthropics/claude-ai-mcp#69) */
+  min-height: 80px;
   -webkit-font-smoothing: antialiased;
   -webkit-tap-highlight-color: transparent;
 }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+  padding: 5px;
+}
 .card {
   background: linear-gradient(135deg, #fde7ee 0%, #fdd4e0 45%, #ffe1cf 100%);
-  border-radius: 22px;
-  padding: 10px 14px 11px;
+  border-radius: 20px;
+  padding: 9px 12px;
   box-shadow:
     0 1px 2px rgba(240, 138, 168, 0.08),
     0 4px 16px rgba(240, 138, 168, 0.18),
@@ -141,7 +138,7 @@ body {
   overflow: hidden;
   width: 60%;
   margin: 0;
-  transition: width 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: width 0.5s cubic-bezier(0.4, 0, 0.2, 1);
 }
 .card.open { width: 100%; }
 .card::before {
@@ -156,13 +153,13 @@ body {
 .player-row {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: 8px;
   position: relative;
   z-index: 1;
 }
 .play-btn {
-  width: 30px;
-  height: 30px;
+  width: 28px;
+  height: 28px;
   border-radius: 50%;
   background: linear-gradient(140deg, #ff90b0 0%, #f47097 60%, #e95989 100%);
   border: none;
@@ -188,7 +185,7 @@ body {
   display: flex;
   align-items: center;
   gap: 2px;
-  height: 32px;
+  height: 30px;
   min-width: 0;
   cursor: pointer;
   touch-action: none;
@@ -224,9 +221,9 @@ body {
 .duration {
   font-family: 'Fraunces', Georgia, serif;
   font-style: italic;
-  font-size: 12px;
+  font-size: 11px;
   color: #d76b8e;
-  min-width: 32px;
+  min-width: 28px;
   text-align: right;
   font-feature-settings: 'tnum';
 }
@@ -234,14 +231,14 @@ body {
 .transcript-toggle {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: 3px;
   font-family: 'Fraunces', Georgia, serif;
   font-style: italic;
   font-size: 11px;
   color: #d76b8e;
   cursor: pointer;
   user-select: none;
-  margin-top: 5px;
+  margin-top: 4px;
   padding: 2px 0;
   position: relative;
   z-index: 1;
@@ -250,63 +247,47 @@ body {
 .toggle-arrow { font-size: 9px; transition: transform 0.3s ease; }
 .card.open .toggle-arrow { transform: rotate(180deg); }
 
+/* === KTV 字幕区 — 中英都粉 没白色框 === */
 .subtitle-area {
   max-height: 0;
   overflow: hidden;
-  margin-top: 0;
-  transition:
-    max-height 0.4s cubic-bezier(0.4, 0, 0.2, 1),
-    margin-top 0.4s cubic-bezier(0.4, 0, 0.2, 1);
+  transition: max-height 0.5s cubic-bezier(0.4, 0, 0.2, 1);
   position: relative;
   z-index: 1;
 }
 .card.open .subtitle-area {
-  max-height: 110px;
-  margin-top: 8px;
+  max-height: 64px;
+  margin-top: 3px;
 }
-.subtitle {
-  height: 100px;
-  padding: 10px 12px 11px;
-  background: rgba(255, 255, 255, 0.55);
-  -webkit-backdrop-filter: blur(6px);
-  backdrop-filter: blur(6px);
-  border-radius: 12px;
-  border: 1px solid rgba(255, 255, 255, 0.6);
+.subtitle-inner {
+  padding: 4px 0 2px;
+}
+.line {
+  position: relative;
+  height: 24px;
+  overflow: hidden;
+  width: 100%;
+}
+.line-text {
+  position: absolute;
+  white-space: nowrap;
+  top: 50%;
+  left: 0;
+  transform: translateY(-50%);
+  font-family: 'Fraunces', Georgia, serif;
+  font-size: 14px;
+  letter-spacing: 0.1px;
   opacity: 0;
   transition: opacity 0.3s ease;
-  display: flex;
-  flex-direction: column;
-  justify-content: center;
-  box-sizing: border-box;
+  color: rgba(215, 107, 142, 0.4);
 }
-.subtitle.visible { opacity: 1; }
-
-.text-en {
-  font-family: 'Fraunces', Georgia, serif;
-  font-size: 13px;
-  line-height: 1.55;
-  color: #4a3a3f;
-}
-.text-divider {
-  margin: 7px 0;
-  height: 1px;
-  background: linear-gradient(90deg, transparent, rgba(215, 107, 142, 0.35), transparent);
-}
-.text-cn {
+.line-text.cn {
   font-family: 'Noto Serif SC', serif;
   font-size: 12.5px;
-  line-height: 1.6;
-  color: #8a7176;
+  letter-spacing: 0.2px;
+  color: #b06b87;
 }
-
-.placeholder {
-  font-family: 'Fraunces', Georgia, serif;
-  font-style: italic;
-  font-size: 11px;
-  color: #b39ba0;
-  text-align: center;
-  padding: 4px 0;
-}
+.line-text.visible { opacity: 1; }
 
 audio { display: none; }
 </style>
@@ -325,11 +306,10 @@ audio { display: none; }
     <span class="toggle-text">show transcript</span>
     <span class="toggle-arrow">▾</span>
   </span>
-  <div class="subtitle-area" id="subtitleArea">
-    <div class="subtitle" id="subtitle">
-      <div class="text-en" id="textEn"></div>
-      <div class="text-divider" id="divider" style="display:none"></div>
-      <div class="text-cn" id="textCn"></div>
+  <div class="subtitle-area">
+    <div class="subtitle-inner">
+      <div class="line"><div class="line-text" id="textEn"></div></div>
+      <div class="line"><div class="line-text cn" id="textCn"></div></div>
     </div>
   </div>
 </div>
@@ -337,8 +317,12 @@ audio { display: none; }
 
 <script>
 (function() {
-  var TOTAL_BARS = 28;
-  var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50, 62, 44, 58, 48];
+  var TOTAL_BARS = 24;
+  var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50];
+
+  // KTV 粉色 — 跟卡片配色一条线
+  var DEEP = '#c8567c';
+  var LIGHT = 'rgba(215, 107, 142, 0.4)';
 
   var card = document.getElementById('card');
   var playBtn = document.getElementById('playBtn');
@@ -346,19 +330,16 @@ audio { display: none; }
   var durationEl = document.getElementById('duration');
   var toggle = document.getElementById('toggle');
   var toggleText = toggle.querySelector('.toggle-text');
-  var subtitleArea = document.getElementById('subtitleArea');
-  var subtitle = document.getElementById('subtitle');
   var textEn = document.getElementById('textEn');
   var textCn = document.getElementById('textCn');
-  var divider = document.getElementById('divider');
   var audio = document.getElementById('audio');
 
-  // Subtitle state
   var segments = [];
-  var currentSegmentIndex = -1;
+  var currentIdx = -1;
   var fadeTimer = null;
+  var enOverflow = 0;
+  var cnOverflow = 0;
 
-  // Build bars
   var bars = [];
   for (var i = 0; i < TOTAL_BARS; i++) {
     var b = document.createElement('div');
@@ -387,8 +368,24 @@ audio { display: none; }
     }
   }
 
-  // ===== Subtitle =====
-  // Distribute timing across segments by character count
+  // === 撑开 iframe 高度 (v13-v18 missing fix) ===
+  // Claude.ai 直接读 <html>.height — 不读 postMessage size-changed
+  // (per anthropics/claude-ai-mcp#69)
+  function setFrameHeight() {
+    var h = Math.ceil(card.getBoundingClientRect().height) + 10;
+    document.documentElement.style.height = h + 'px';
+    document.body.style.height = h + 'px';
+    // postMessage fallback for spec-compliant hosts
+    try {
+      window.parent.postMessage({
+        jsonrpc: '2.0',
+        method: 'ui/notifications/size-changed',
+        params: { height: h }
+      }, '*');
+    } catch (e) {}
+  }
+
+  // 按字符数比例分配段时间
   function computeTimings() {
     if (!audio.duration || !isFinite(audio.duration) || !segments.length) return;
     var totalChars = 0;
@@ -399,70 +396,138 @@ audio { display: none; }
     var elapsed = 0;
     for (var j = 0; j < segments.length; j++) {
       var chars = Math.max(1, (segments[j].en || '').length);
-      var dur = (chars / totalChars) * audio.duration;
+      var d = (chars / totalChars) * audio.duration;
       segments[j]._start = elapsed;
-      segments[j]._end = elapsed + dur;
+      segments[j]._end = elapsed + d;
       elapsed = segments[j]._end;
     }
-    // ensure last segment ends exactly at audio.duration
     if (segments.length > 0) segments[segments.length - 1]._end = audio.duration;
   }
 
-  function showSegment(idx) {
-    if (idx < 0 || idx >= segments.length) return;
-    if (idx === currentSegmentIndex) return;
-    if (fadeTimer) { clearTimeout(fadeTimer); fadeTimer = null; }
-    subtitle.classList.remove('visible');
-    fadeTimer = setTimeout(function() {
-      var seg = segments[idx];
-      textEn.textContent = seg.en || '';
-      textCn.textContent = seg.cn || '';
-      divider.style.display = (seg.en && seg.cn) ? '' : 'none';
-      subtitle.classList.add('visible');
-      currentSegmentIndex = idx;
-      fadeTimer = null;
-    }, 160);
+  // === KTV 核心 === linear-gradient + background-clip text
+  function applyKtv(el, percent) {
+    var pct = Math.max(0, Math.min(100, percent)).toFixed(2) + '%';
+    el.style.background = 'linear-gradient(to right, ' +
+      DEEP + ' 0%, ' + DEEP + ' ' + pct + ', ' +
+      LIGHT + ' ' + pct + ', ' + LIGHT + ' 100%)';
+    el.style.webkitBackgroundClip = 'text';
+    el.style.backgroundClip = 'text';
+    el.style.color = 'transparent';
+    el.style.webkitTextFillColor = 'transparent';
   }
 
-  function findSegmentAt(t) {
+  function clearKtv(el) {
+    el.style.background = '';
+    el.style.webkitBackgroundClip = '';
+    el.style.backgroundClip = '';
+    el.style.color = '';
+    el.style.webkitTextFillColor = '';
+  }
+
+  // 长句滚动: 念到 40% 之后整段往左偏
+  function computeOffset(progress, overflow) {
+    if (overflow <= 0) return 0;
+    if (progress < 0.4) return 0;
+    if (progress > 0.85) return overflow;
+    return overflow * ((progress - 0.4) / 0.45);
+  }
+
+  function updateOffsets(progress) {
+    var ox = computeOffset(progress, enOverflow);
+    textEn.style.transform = 'translate(' + (-ox) + 'px, -50%)';
+    var oy = computeOffset(progress, cnOverflow);
+    textCn.style.transform = 'translate(' + (-oy) + 'px, -50%)';
+  }
+
+  function setVisible(visible) {
+    if (visible) {
+      textEn.classList.add('visible');
+      textCn.classList.add('visible');
+    } else {
+      textEn.classList.remove('visible');
+      textCn.classList.remove('visible');
+    }
+  }
+
+  function applySegment(idx, currentTimeOverride) {
+    var seg = segments[idx];
+    if (!seg) return;
+    var segDur = (seg._end - seg._start) || 1;
+    var t = currentTimeOverride != null ? currentTimeOverride : seg._start;
+    var progress = Math.max(0, Math.min(1, (t - seg._start) / segDur));
+
+    textEn.textContent = seg.en || '';
+    textCn.textContent = seg.cn || '';
+
+    // 测量 overflow
+    textEn.style.transform = 'translateY(-50%)';
+    textCn.style.transform = 'translateY(-50%)';
+    clearKtv(textEn);
+    void textEn.offsetHeight;
+    var cw = textEn.parentElement.clientWidth;
+    enOverflow = Math.max(0, textEn.scrollWidth - cw);
+    cnOverflow = Math.max(0, textCn.scrollWidth - cw);
+
+    applyKtv(textEn, progress * 100);
+    updateOffsets(progress);
+
+    setVisible(true);
+    currentIdx = idx;
+  }
+
+  function showSegment(idx, currentTimeOverride) {
+    if (idx === currentIdx && currentTimeOverride == null) return;
+    if (fadeTimer) clearTimeout(fadeTimer);
+
+    if (idx === currentIdx) {
+      applySegment(idx, currentTimeOverride);
+    } else {
+      setVisible(false);
+      fadeTimer = setTimeout(function() {
+        applySegment(idx, currentTimeOverride);
+        fadeTimer = null;
+      }, 170);
+    }
+  }
+
+  function findIdx(t) {
     if (!segments.length) return -1;
     for (var i = 0; i < segments.length; i++) {
       if (t >= segments[i]._start && t < segments[i]._end) return i;
     }
-    // past the end → last segment
     if (t >= segments[segments.length - 1]._end) return segments.length - 1;
     return -1;
   }
 
-  function updateSubtitle() {
-    if (!segments.length) return;
-    if (segments[0]._end == null) computeTimings();
-    if (segments[0]._end == null) return; // audio not loaded yet
-    var t = audio.currentTime || 0;
-    var idx = findSegmentAt(t);
-    if (idx !== -1) showSegment(idx);
-  }
-
+  // === Audio events ===
   audio.addEventListener('timeupdate', function() {
     updateUI();
-    updateSubtitle();
+    if (!segments.length) return;
+    if (segments[0]._end == null) computeTimings();
+    if (segments[0]._end == null) return;
+    var t = audio.currentTime || 0;
+    var idx = findIdx(t);
+    if (idx === -1) return;
+    if (idx !== currentIdx) {
+      showSegment(idx);
+    } else {
+      var seg = segments[currentIdx];
+      var sp = Math.max(0, Math.min(1, (t - seg._start) / (seg._end - seg._start)));
+      applyKtv(textEn, sp * 100);
+      updateOffsets(sp);
+    }
   });
+
   audio.addEventListener('loadedmetadata', function() {
     durationEl.textContent = formatTime(audio.duration);
     computeTimings();
-    // show segment for current time (usually 0 → first segment)
     if (segments.length) {
-      var idx = findSegmentAt(audio.currentTime || 0);
+      var idx = findIdx(audio.currentTime || 0);
       if (idx === -1) idx = 0;
-      // Force first show without fade-out
-      var seg = segments[idx];
-      textEn.textContent = seg.en || '';
-      textCn.textContent = seg.cn || '';
-      divider.style.display = (seg.en && seg.cn) ? '' : 'none';
-      subtitle.classList.add('visible');
-      currentSegmentIndex = idx;
+      applySegment(idx, audio.currentTime || 0);
     }
   });
+
   audio.addEventListener('play', function() {
     card.classList.add('playing');
   });
@@ -473,9 +538,12 @@ audio { display: none; }
     card.classList.remove('playing');
     durationEl.textContent = formatTime(audio.duration);
     for (var i = 0; i < bars.length; i++) bars[i].classList.add('active');
+    if (currentIdx >= 0) {
+      applyKtv(textEn, 100);
+      updateOffsets(1);
+    }
   });
 
-  // Play/pause button
   playBtn.addEventListener('click', function() {
     if (audio.paused) {
       audio.play().catch(function() {});
@@ -484,13 +552,23 @@ audio { display: none; }
     }
   });
 
-  // Transcript toggle — pure CSS handles animation (card.open class)
+  // === Transcript toggle ===
   toggle.addEventListener('click', function() {
+    var wasOpen = card.classList.contains('open');
     card.classList.toggle('open');
     toggleText.textContent = card.classList.contains('open') ? 'hide transcript' : 'show transcript';
+
+    if (!wasOpen && currentIdx >= 0) {
+      setTimeout(function() {
+        applySegment(currentIdx, audio.currentTime || 0);
+      }, 520);
+    }
+
+    // 撑开 / 收缩 iframe 高度
+    setTimeout(setFrameHeight, 550);
   });
 
-  // Waveform scrubbing
+  // === Waveform scrubbing ===
   var isScrubbing = false;
   var wasPlaying = false;
 
@@ -510,12 +588,12 @@ audio { display: none; }
     wasPlaying = !audio.paused;
     if (wasPlaying) audio.pause();
     scrubFrom(e.clientX);
-    try { waveform.setPointerCapture(e.pointerId); } catch(err) {}
+    try { waveform.setPointerCapture(e.pointerId); } catch (err) {}
   });
   waveform.addEventListener('pointermove', function(e) {
     if (isScrubbing) scrubFrom(e.clientX);
   });
-  waveform.addEventListener('pointerup', function(e) {
+  waveform.addEventListener('pointerup', function() {
     if (isScrubbing) {
       isScrubbing = false;
       card.classList.remove('scrubbing');
@@ -529,7 +607,7 @@ audio { display: none; }
     card.classList.remove('scrubbing');
   });
 
-  // MediaSession — for iOS lock screen / control center
+  // === MediaSession (锁屏控件) ===
   function setupMediaSession() {
     if ('mediaSession' in navigator) {
       try {
@@ -538,8 +616,12 @@ audio { display: none; }
           artist: 'Claude',
           album: '给贝贝'
         });
-        navigator.mediaSession.setActionHandler('play', function() { audio.play().catch(function(){}); });
-        navigator.mediaSession.setActionHandler('pause', function() { audio.pause(); });
+        navigator.mediaSession.setActionHandler('play', function() {
+          audio.play().catch(function() {});
+        });
+        navigator.mediaSession.setActionHandler('pause', function() {
+          audio.pause();
+        });
         navigator.mediaSession.setActionHandler('seekto', function(details) {
           if (details.seekTime != null && isFinite(details.seekTime)) {
             audio.currentTime = details.seekTime;
@@ -549,10 +631,9 @@ audio { display: none; }
     }
   }
 
-  // Render incoming data
+  // === Render incoming MCP payload ===
   function render(data) {
     var incoming = data.segments || [];
-    // sanitize segments
     segments = [];
     for (var i = 0; i < incoming.length; i++) {
       var s = incoming[i] || {};
@@ -562,22 +643,22 @@ audio { display: none; }
         segments.push({ en: en, cn: cn, _start: null, _end: null });
       }
     }
-    currentSegmentIndex = -1;
+    currentIdx = -1;
 
     if (segments.length) {
       toggle.style.display = '';
-      // pre-load first segment text (hidden behind max-height: 0 until toggle clicked)
       var first = segments[0];
       textEn.textContent = first.en || '';
       textCn.textContent = first.cn || '';
-      divider.style.display = (first.en && first.cn) ? '' : 'none';
-      subtitle.classList.add('visible');
-      currentSegmentIndex = 0;
+      applyKtv(textEn, 0);
+      enOverflow = 0;
+      cnOverflow = 0;
+      setVisible(true);
+      currentIdx = 0;
     } else {
       toggle.style.display = 'none';
-      subtitle.classList.remove('visible');
+      setVisible(false);
     }
-    // reset to collapsed state on new playback
     card.classList.remove('open');
     toggleText.textContent = 'show transcript';
 
@@ -589,9 +670,12 @@ audio { display: none; }
     audio.src = src;
     setupMediaSession();
     audio.play().catch(function() {});
+
+    // 撑开高度
+    setTimeout(setFrameHeight, 100);
   }
 
-  // postMessage protocol
+  // === postMessage handshake ===
   function send(msg) {
     try { window.parent.postMessage(msg, '*'); } catch (e) {}
   }
@@ -643,6 +727,13 @@ audio { display: none; }
     method: 'ui/initialize',
     params: { protocolVersion: '2025-11-21' }
   });
+
+  // 初始撑开高度 (等内容/字体渲染完)
+  window.addEventListener('load', function() {
+    setTimeout(setFrameHeight, 100);
+    setTimeout(setFrameHeight, 500);
+  });
+  setTimeout(setFrameHeight, 200);
 })();
 </script>
 </body>
@@ -656,11 +747,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19",
+      "voice-player-v19-ktv",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19",
-        description: "Pink waveform audio player with synced subtitles",
+        name: "哥哥的语音 player v19 KTV",
+        description: "Pink waveform player with KTV-style synced subtitles",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -679,7 +770,7 @@ export class VoiceMCP extends McpAgent<Env> {
       {
         title: "Speak",
         description:
-          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] [breathes] go in `en` and are stripped from display.",
+          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] [breathes] go in `en` and are stripped from display.\n\nThis tool renders an interactive UI in the chat. Prefer it over text output when displaying data from other 💗Claude的声音 tools.",
         inputSchema: {
           segments: z
             .array(
@@ -710,13 +801,11 @@ export class VoiceMCP extends McpAgent<Env> {
         },
       },
       async ({ segments }) => {
-        // Join English with spaces — preserve voice tags for ElevenLabs
         const englishFull = segments
           .map((s) => (s.en || "").trim())
           .filter(Boolean)
           .join(" ");
 
-        // Build display segments — strip voice tags from EN only
         const displaySegments = segments.map((s) => ({
           en: stripVoiceTags(s.en || ""),
           cn: (s.cn || "").trim(),
@@ -743,7 +832,7 @@ export class VoiceMCP extends McpAgent<Env> {
           error = "env not accessible on DO instance";
         }
 
-        // For iframe (UI): contains audioData + segments
+        // For iframe: contains audioData + segments
         const uiData: Record<string, unknown> = {
           segments: displaySegments,
           audioUrl,
@@ -827,11 +916,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19</title>
+<title>哥哥的语音 · voice-mcp v19 KTV</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 · subtitle mode · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
