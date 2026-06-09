@@ -1,21 +1,19 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v4) · voice tag fix + scrub fix
+ * voice-mcp · 哥哥的语音 (v19 KTV v5) · switch to eleven_v3 model
  *
- * v19-ktv-v3 → v19-ktv-v4:
- *   1. **Strip voice tag 后再送 ElevenLabs**
- *      - eleven_multilingual_v2 model 不支持 [softly] [warmly] audio tag
- *      - 之前发 raw text 含 [softly] — ElevenLabs 把 [softly] 当字面字念出来
- *      - "听到 softly 没字幕" bug 的真根
- *      - 修法: 在 worker 送给 ElevenLabs 前 stripVoiceTags
- *      - alignment 也基于 stripped text — 段 char positions 干净
- *      - 副作用: 失去 [softly]/[warmly] 控制 — 但本来就没在 work (illusion)
- *   2. **Scrub 显式 update segment**
- *      - audio.paused 时 timeupdate 不 fire — 拖动进度条字幕不变
- *      - 修法: scrubFrom 改 currentTime 后 直接 call findIdx + showSegment
- *   3. **measure phase 防 flash**
- *      - 切段时 deep layer 重置 clip-path 那一帧可能 visible — 字"突然变大"
- *      - 修法: applySegment 在 measure 期间 visibility:hidden deep layer
- *   4. URI bump → player-v19-ktv-v4.html
+ * v19-ktv-v4 → v19-ktv-v5:
+ *   1. **model_id 换成 `eleven_v3`**
+ *      - multilingual_v2 不支持 audio tag — 之前 [softly] 被念字面
+ *      - eleven_v3 (Alpha) 支持 audio tag 作为情感控制
+ *      - 支持 tags: [softly] [warmly] [whispers] [laughs] [light chuckle]
+ *        [sighs] [breathes] [mischievously] [curious] [excited] 等
+ *      - v3 也支持 with-timestamps endpoint (alignment 不变)
+ *   2. **发原文 (含 tag) 给 ElevenLabs**
+ *      - v3 model 会解析 tag 为情感不念字面 — 不需要 strip
+ *      - alignment char positions 用 raw text length (含 tag chars)
+ *   3. **iframe display 仍用 stripped 文本**
+ *      - audio 不念 tag — 字幕也不显示 tag — 一致
+ *   4. URI bump → player-v19-ktv-v5.html
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -32,9 +30,10 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v4.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v5.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
-const TTS_MODEL_ID = "eleven_multilingual_v2";
+// === v5 关键改动: model 换成 eleven_v3 ===
+const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
 
 function stripVoiceTags(text: string): string {
@@ -132,7 +131,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v4 iframe — voice tag fix + scrub fix + flash protection
+// v19 KTV v5 iframe — eleven_v3 model (audio tags work)
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -510,7 +509,6 @@ audio { display: none; }
     var enText = seg.en || '';
     var cnText = seg.cn || '';
 
-    // === measure phase 防 flash: 临时藏 deep layer ===
     textEnDeep.style.visibility = 'hidden';
     textCnDeep.style.visibility = 'hidden';
 
@@ -532,7 +530,6 @@ audio { display: none; }
     applyKtv(progress * 100);
     updateOffsets(progress);
 
-    // === deep layer 现已 clip-path 干净 — 显示出来 ===
     textEnDeep.style.visibility = '';
     textCnDeep.style.visibility = '';
 
@@ -666,7 +663,6 @@ audio { display: none; }
     setTimeout(measureAndCache, 560);
   });
 
-  // === Scrubbing (v4: 显式 update segment + 进度) ===
   var isScrubbing = false;
   var wasPlaying = false;
 
@@ -678,14 +674,12 @@ audio { display: none; }
     var newTime = ratio * audio.duration;
     audio.currentTime = newTime;
 
-    // 显式 update 字幕 (paused 时 timeupdate 不 fire)
     if (segments.length) {
       computeTimings();
       if (segments[0]._end != null) {
         var idx = findIdx(newTime);
         if (idx !== -1) {
           showSegment(idx, newTime);
-          // 同段 scrub 也要 update 进度
           if (idx === currentIdx) {
             var seg = segments[idx];
             var sp = (newTime - seg._start) / (seg._end - seg._start);
@@ -867,11 +861,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v4",
+      "voice-player-v19-ktv-v5",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v4",
-        description: "Pink waveform with KTV subtitles (stripped voice tags + scrub fix)",
+        name: "哥哥的语音 player v19 KTV v5",
+        description: "Pink waveform with KTV subtitles (eleven_v3 + audio tags work)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -890,7 +884,7 @@ export class VoiceMCP extends McpAgent<Env> {
       {
         title: "Speak",
         description:
-          "Speak with Claude's cloned voice (ElevenLabs). Pass sentences as `segments` — each {en, cn} pair will display in sync with the audio as a subtitle. Keep en segments short (one sentence or short clause) for natural pacing. Voice tags like [softly] [warmly] are stripped before sending to ElevenLabs (the multilingual_v2 model doesn't actually parse them — including them would result in the tag being spoken as literal text). Pass plain English instead.\n\nThis tool renders an interactive UI in the chat. Prefer it over text output when displaying data from other 💗Claude的声音 tools.",
+          "Speak with Claude's cloned voice (ElevenLabs eleven_v3 model). Pass sentences as `segments` — each {en, cn} pair shows in sync with audio as KTV subtitles. eleven_v3 supports audio tags for emotional control: [softly] [warmly] [whispers] [laughs] [light chuckle] [sighs] [breathes] [mischievously] [curious] [excited] [sarcastically] etc. Put tags in `en` — ElevenLabs reads them as emotion (not spoken literally). Tags are stripped from subtitle display.\n\nThis tool renders an interactive UI in the chat. Prefer it over text output when displaying data from other 💗Claude的声音 tools.",
         inputSchema: {
           segments: z
             .array(
@@ -898,7 +892,7 @@ export class VoiceMCP extends McpAgent<Env> {
                 en: z
                   .string()
                   .describe(
-                    "English sentence. Voice tags like [softly] will be stripped before TTS — multilingual_v2 doesn't support them. Use plain text."
+                    "English sentence. May include audio tags like [softly] [warmly] [light chuckle] — these control emotion in eleven_v3 and are stripped from display."
                   ),
                 cn: z
                   .string()
@@ -908,7 +902,7 @@ export class VoiceMCP extends McpAgent<Env> {
             )
             .min(1)
             .describe(
-              "Array of sentence pairs. English joined for ElevenLabs (after voice tag strip); pairs shown as synced KTV subtitles."
+              "Array of sentence pairs. English (with audio tags) sent to ElevenLabs eleven_v3; tag-stripped pairs shown as KTV subtitles."
             ),
         },
         _meta: {
@@ -921,25 +915,25 @@ export class VoiceMCP extends McpAgent<Env> {
         },
       },
       async ({ segments }) => {
-        // === v4 fix: Strip voice tag 之前 send 给 ElevenLabs ===
-        // multilingual_v2 不识别 [softly] [warmly] tag — 会念字面
-        const validRaw: Array<{ en: string; cn: string; enStripped: string }> = [];
+        // === v5: 发原文 (含 tag) 给 ElevenLabs eleven_v3 ===
+        // v3 model 解析 audio tag 为情感控制 — 不会念字面
+        const validRaw: Array<{ enRaw: string; enStripped: string; cn: string }> = [];
         for (const s of segments) {
           const enRaw = (s.en || "").trim();
           const enStripped = stripVoiceTags(enRaw);
           if (enStripped) {
             validRaw.push({
-              en: enRaw,
+              enRaw,
               enStripped,
               cn: (s.cn || "").trim(),
             });
           }
         }
 
-        // 送给 ElevenLabs 的是 stripped text (无 [softly] [warmly] 字面)
-        const englishStripped = validRaw.map((s) => s.enStripped).join(" ");
+        // ElevenLabs 收原文 (含 tag) — v3 解析 tag 为情感
+        const englishRaw = validRaw.map((s) => s.enRaw).join(" ");
 
-        // 显示字幕也是 stripped (跟 audio 一致)
+        // iframe 字幕显示 stripped — 跟 audio 念出的一致
         const displaySegments: any[] = validRaw.map((s) => ({
           en: s.enStripped,
           cn: s.cn,
@@ -948,7 +942,7 @@ export class VoiceMCP extends McpAgent<Env> {
         }));
 
         let audioData = "";
-        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishStripped)}`;
+        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishRaw)}`;
         let error = "";
 
         const { env } = findEnvOnInstance(this);
@@ -956,13 +950,13 @@ export class VoiceMCP extends McpAgent<Env> {
         if (env) {
           try {
             const { audioBase64, alignment } = await generateSpeechWithTimings(
-              englishStripped,
+              englishRaw,
               env.VOICE_ID,
               env.ELEVENLABS_API_KEY
             );
             audioData = audioBase64;
 
-            // 算每段精确 timing (基于 stripped text 的 char positions)
+            // === alignment char positions 用 raw text length (含 tag chars) ===
             if (
               alignment &&
               alignment.character_start_times_seconds &&
@@ -972,9 +966,9 @@ export class VoiceMCP extends McpAgent<Env> {
               const ends = alignment.character_end_times_seconds;
               let charPos = 0;
               for (let i = 0; i < validRaw.length; i++) {
-                const en = validRaw[i].enStripped;
+                const enRaw = validRaw[i].enRaw;
                 const segStartIdx = charPos;
-                const segEndIdx = charPos + en.length - 1;
+                const segEndIdx = charPos + enRaw.length - 1;
 
                 const startTime =
                   starts[Math.min(segStartIdx, starts.length - 1)] ?? 0;
@@ -985,7 +979,7 @@ export class VoiceMCP extends McpAgent<Env> {
                 displaySegments[i]._start = startTime;
                 displaySegments[i]._end = endTime;
 
-                charPos = segEndIdx + 1 + 1;
+                charPos = segEndIdx + 1 + 1; // +1 自身末位, +1 空格 joiner
               }
             }
           } catch (e: any) {
@@ -1014,9 +1008,10 @@ export class VoiceMCP extends McpAgent<Env> {
           spoken: displayJoined,
           chinese: chineseJoined,
           segments: displaySegments.length,
+          model: TTS_MODEL_ID,
           status: error
             ? `error: ${error}`
-            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, precise timing, tags stripped)`,
+            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, eleven_v3 with tags)`,
         };
 
         return {
@@ -1077,11 +1072,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v4</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v5</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v4 · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v5 (eleven_v3) · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
