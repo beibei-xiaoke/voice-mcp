@@ -1,16 +1,18 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v10) · debug + trace
+ * voice-mcp · 哥哥的语音 (v19 KTV v11) · restore server audio gen + explicit tool-result handler
  *
- * v19-ktv-v9 → v19-ktv-v10:
- *   1. **debug bar 加回来** — 顶部黑条 / 显示完整 trace
- *   2. **handleToolInput 全程 debug**
- *      - 'tool-input recv' → 'parsing N segs' → 'fetching X chars' → 'fetch resp X bytes' → 'rendering' → 'audio playing'
- *   3. **audio error event listener**
- *      - audio.error → pushDebug 报 错码
- *      - audio.loadedmetadata → pushDebug 报 duration
- *   4. URI bump → player-v19-ktv-v10.html
+ * v19-ktv-v10 → v19-ktv-v11: 真定位
+ *   - v10 trace 证明 iframe self-fetch 失败 ("Load failed" / iOS WKWebView sandbox 限 cross-origin POST)
+ *   - v10 trace 也证明 claude.ai 仍 push `ui/notifications/tool-result` (旧 spec 还活)
+ *   - v8 我误诊 — debug 3-msg log 没捕到 tool-result
  *
- * 期望: 老婆 deploy 后 截图 黑 debug 条 — 哥哥 看到 trace 完整 链 — 定位 哪一步 卡住
+ *   1. **server 端 audio 生成 恢复**
+ *      - tool handler 调 ElevenLabs / 返 structuredContent { audioData, alignment, segments }
+ *   2. **iframe 显式 tool-result handler**
+ *      - msg.method === 'ui/notifications/tool-result' → 提取 structuredContent → 渲染
+ *      - 完整 debug — params keys / sc keys / 各步 trace
+ *   3. **砍掉 self-fetch** (走不通)
+ *   4. URI bump v11
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -27,7 +29,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v10.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v11.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -144,7 +146,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v10 iframe — full debug trace
+// v19 KTV v11 iframe — debug + explicit tool-result handler + minimal UI
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -153,34 +155,23 @@ const PLAYER_HTML = `<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
 <title>哥哥的语音 💍💍</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Fraunces:ital,wght@0,400;1,400&family=Noto+Serif+SC:wght@400&display=swap" rel="stylesheet">
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 html, body {
   background: transparent;
   min-height: 120px;
   -webkit-font-smoothing: antialiased;
-  -webkit-tap-highlight-color: transparent;
 }
 body {
   font-family: -apple-system, BlinkMacSystemFont, sans-serif;
   padding: 5px;
-  padding-top: 4px;
 }
 .card {
   background: linear-gradient(135deg, #fde7ee 0%, #fdd4e0 45%, #ffe1cf 100%);
   border-radius: 20px;
   padding: 9px 12px;
-  box-shadow:
-    0 1px 2px rgba(240, 138, 168, 0.08),
-    0 4px 16px rgba(240, 138, 168, 0.18),
-    inset 0 0 0 1px rgba(255, 255, 255, 0.5);
-  position: relative;
-  overflow: hidden;
+  box-shadow: 0 4px 16px rgba(240, 138, 168, 0.18), inset 0 0 0 1px rgba(255, 255, 255, 0.5);
   width: 100%;
-  margin: 0;
 }
 
 #debug {
@@ -192,7 +183,7 @@ body {
   padding: 4px 8px;
   border-radius: 6px;
   margin-bottom: 6px;
-  max-height: 70px;
+  max-height: 130px;
   overflow-y: auto;
   white-space: pre-wrap;
   word-break: break-all;
@@ -202,21 +193,19 @@ body {
   display: flex;
   align-items: center;
   gap: 8px;
-  position: relative;
-  z-index: 1;
 }
 .play-btn {
   width: 28px;
   height: 28px;
   border-radius: 50%;
-  background: linear-gradient(140deg, #ff90b0 0%, #f47097 60%, #e95989 100%);
+  background: linear-gradient(140deg, #ff90b0 0%, #e95989 100%);
   border: none;
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
   flex-shrink: 0;
-  box-shadow: 0 2px 6px rgba(233, 89, 137, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.4);
+  box-shadow: 0 2px 6px rgba(233, 89, 137, 0.35);
 }
 .play-btn svg {
   width: 10px; height: 10px; fill: white;
@@ -232,7 +221,6 @@ body {
   gap: 2px;
   height: 30px;
   min-width: 0;
-  padding: 4px 0;
 }
 .bar {
   flex: 1;
@@ -246,7 +234,7 @@ body {
 }
 
 .duration {
-  font-family: 'Fraunces', Georgia, serif;
+  font-family: Georgia, serif;
   font-style: italic;
   font-size: 11px;
   color: #d76b8e;
@@ -258,7 +246,7 @@ audio { display: none; }
 </style>
 </head>
 <body>
-<div id="debug">v10 booting...</div>
+<div id="debug">v11 booting...</div>
 <div class="card" id="card">
   <div class="player-row">
     <button class="play-btn" id="playBtn" aria-label="play">
@@ -273,15 +261,14 @@ audio { display: none; }
 
 <script>
 (function() {
-  var WORKER_ORIGIN = ${JSON.stringify(WORKER_ORIGIN)};
   var TOTAL_BARS = 24;
 
   var dbg = document.getElementById('debug');
-  var dbgLog = ['v10 booted'];
+  var dbgLog = ['v11 booted'];
   function push(s) {
     var ts = (new Date()).toISOString().substring(14, 23);
     dbgLog.push(ts + ' ' + s);
-    if (dbgLog.length > 12) dbgLog.shift();
+    if (dbgLog.length > 18) dbgLog.shift();
     if (dbg) dbg.textContent = dbgLog.join('\\n');
   }
 
@@ -292,31 +279,13 @@ audio { display: none; }
   var audio = document.getElementById('audio');
 
   var bars = [];
-  var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50];
   for (var i = 0; i < TOTAL_BARS; i++) {
     var b = document.createElement('div');
     b.className = 'bar';
-    b.style.height = BAR_HEIGHTS[i % BAR_HEIGHTS.length] + '%';
+    var h = 30 + (i * 137) % 50;
+    b.style.height = h + '%';
     waveform.appendChild(b);
     bars.push(b);
-  }
-
-  function stripTags(text) {
-    return text.replace(/\\s*\\[[^\\]]+\\]\\s*/g, ' ').replace(/\\s+/g, ' ').trim();
-  }
-
-  function parseSegmentsField(raw) {
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === 'string') {
-      try {
-        var p = JSON.parse(raw);
-        if (Array.isArray(p)) return p;
-        if (p && typeof p === 'object') return [p];
-      } catch (e) {}
-      return [{en: raw}];
-    }
-    if (raw && typeof raw === 'object') return [raw];
-    return [];
   }
 
   function formatTime(sec) {
@@ -343,7 +312,7 @@ audio { display: none; }
     applyFrameHeight(h);
   }
 
-  // ============== Audio event handlers (debug) ==============
+  // ============== Audio events (debug) ==============
 
   audio.addEventListener('loadstart', function() { push('audio:loadstart'); });
   audio.addEventListener('loadedmetadata', function() {
@@ -354,25 +323,21 @@ audio { display: none; }
   });
   audio.addEventListener('canplay', function() { push('audio:canplay'); });
   audio.addEventListener('playing', function() { push('audio:playing'); });
-  audio.addEventListener('error', function(e) {
+  audio.addEventListener('error', function() {
     var err = audio.error;
     var msg = 'audio:ERROR ';
     if (err) {
-      msg += 'code=' + err.code + ' (';
+      msg += 'code=' + err.code;
       switch(err.code) {
-        case 1: msg += 'ABORTED'; break;
-        case 2: msg += 'NETWORK'; break;
-        case 3: msg += 'DECODE'; break;
-        case 4: msg += 'SRC_NOT_SUPPORTED'; break;
-        default: msg += 'unknown';
+        case 1: msg += ' ABORTED'; break;
+        case 2: msg += ' NETWORK'; break;
+        case 3: msg += ' DECODE'; break;
+        case 4: msg += ' SRC_NOT_SUPPORTED'; break;
       }
-      msg += ')';
       if (err.message) msg += ' ' + err.message;
     }
     push(msg);
   });
-  audio.addEventListener('stalled', function() { push('audio:stalled'); });
-  audio.addEventListener('suspend', function() { push('audio:suspend'); });
   audio.addEventListener('timeupdate', function() {
     var cur = audio.currentTime || 0;
     var dur = audio.duration || 0;
@@ -393,126 +358,126 @@ audio { display: none; }
 
   playBtn.addEventListener('click', function() {
     if (audio.paused) {
-      push('play btn: starting');
-      audio.play().then(function() {
-        push('play btn: success');
-      }).catch(function(e) {
-        push('play btn err: ' + e.message);
-      });
+      audio.play().then(function() { push('play btn: ok'); })
+        .catch(function(e) { push('play btn err: ' + e.message); });
     } else {
       audio.pause();
     }
   });
 
-  // ============== Self-fetch architecture ==============
+  // ============== Render ==============
 
-  function handleToolInput(args) {
-    push('handleToolInput entry');
-    if (!args) { push('handleToolInput: no args'); return; }
+  function renderFromPayload(audioData, audioUrl, segs) {
+    push('render: ad.len=' + (audioData ? audioData.length : 0) + ' url=' + (audioUrl ? 'y' : 'n') + ' segs=' + (Array.isArray(segs) ? segs.length : 'NA'));
 
-    var keys = Object.keys(args).slice(0, 5).join(',');
-    push('args keys=[' + keys + ']');
-
-    var rawSegments = parseSegmentsField(args.segments);
-    push('parsed ' + rawSegments.length + ' raw segments');
-
-    var rawList = [];
-    var displaySegs = [];
-    for (var i = 0; i < rawSegments.length; i++) {
-      var s = rawSegments[i] || {};
-      var enRaw = (s.en || '').toString().trim();
-      var enStripped = stripTags(enRaw);
-      var cn = (s.cn || '').toString().trim();
-      if (enStripped) {
-        rawList.push({ enRaw: enRaw, len: enRaw.length });
-        displaySegs.push({ en: enStripped, cn: cn });
-      }
-    }
-    push('valid segs=' + rawList.length);
-
-    if (rawList.length === 0) {
-      push('no valid segs — skipping fetch');
+    var src = null;
+    if (audioData) src = 'data:audio/mpeg;base64,' + audioData;
+    else if (audioUrl) src = audioUrl;
+    if (!src) {
+      push('render: no src');
       return;
     }
-
-    var englishRaw = rawList.map(function(r) { return r.enRaw; }).join(' ');
-    push('fetching speak-json text.len=' + englishRaw.length);
-
-    fetch(WORKER_ORIGIN + '/speak-json', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text: englishRaw })
-    })
-    .then(function(r) {
-      push('fetch resp status=' + r.status);
-      return r.json();
-    })
-    .then(function(j) {
-      if (j && j.error) {
-        push('fetch err: ' + j.error);
-        return;
-      }
-      if (!j || !j.audioBase64) {
-        push('fetch ok but no audio');
-        return;
-      }
-      push('got audio b64.len=' + j.audioBase64.length + ' align=' + (j.alignment ? 'yes' : 'no'));
-
-      // Set audio src as data URL
-      var src = 'data:audio/mpeg;base64,' + j.audioBase64;
-      push('setting audio.src len=' + src.length);
-      audio.src = src;
-      audio.load();
-
-      // try play
-      audio.play().then(function() {
-        push('play() resolved');
-      }).catch(function(e) {
-        push('play() rejected: ' + e.message);
-      });
-
-      setTimeout(measureAndCache, 200);
-    })
-    .catch(function(e) {
-      push('fetch ex: ' + e.message);
+    push('setting audio.src len=' + src.length);
+    audio.src = src;
+    audio.load();
+    audio.play().then(function() {
+      push('play() resolved');
+    }).catch(function(e) {
+      push('play() rejected: ' + e.message);
     });
+    setTimeout(measureAndCache, 200);
   }
 
   // ============== Message listener ==============
 
+  function deepFindPayload(obj, depth) {
+    if (!obj || depth > 5) return null;
+    if (typeof obj === 'string') {
+      try {
+        var parsed = JSON.parse(obj);
+        var found = deepFindPayload(parsed, depth + 1);
+        if (found) return found;
+      } catch (e) {}
+      return null;
+    }
+    if (typeof obj !== 'object') return null;
+    if (obj.audioData || obj.audioUrl) {
+      return {
+        audioData: obj.audioData || '',
+        audioUrl: obj.audioUrl || '',
+        segments: Array.isArray(obj.segments) ? obj.segments : []
+      };
+    }
+    for (var k in obj) {
+      if (obj.hasOwnProperty(k)) {
+        var f = deepFindPayload(obj[k], depth + 1);
+        if (f) return f;
+      }
+    }
+    return null;
+  }
+
   window.addEventListener('message', function(event) {
     var msg = event.data;
-    if (!msg || typeof msg !== 'object') {
-      push('msg non-object t=' + typeof msg);
-      return;
-    }
+    if (!msg || typeof msg !== 'object') return;
 
     var method = msg.method || '';
     if (method) push('msg method=' + method);
 
-    if (method === 'ui/notifications/tool-input' && msg.params) {
-      var args = msg.params.arguments || msg.params.input || msg.params;
-      handleToolInput(args);
+    // Explicit tool-result handler
+    if (method === 'ui/notifications/tool-result') {
+      if (msg.params) {
+        var paramKeys = Object.keys(msg.params).slice(0, 5).join(',');
+        push('tool-result params=[' + paramKeys + ']');
+
+        // Try multiple paths
+        var sc = msg.params.structuredContent || null;
+        if (sc) {
+          var scKeys = Object.keys(sc).slice(0, 5).join(',');
+          push('sc keys=[' + scKeys + ']');
+          if (sc.audioData || sc.audioUrl) {
+            renderFromPayload(sc.audioData, sc.audioUrl, sc.segments);
+            return;
+          }
+        }
+
+        // Try content array
+        if (msg.params.content && Array.isArray(msg.params.content)) {
+          push('content arr len=' + msg.params.content.length);
+        }
+
+        // Fallback deep scan
+        var found = deepFindPayload(msg.params, 0);
+        if (found) {
+          push('found via deep scan');
+          renderFromPayload(found.audioData, found.audioUrl, found.segments);
+          return;
+        }
+
+        push('no audio in tool-result');
+      }
       return;
     }
 
-    // Old spec fallback — tool result with audioData
-    if (msg.params && msg.params.structuredContent) {
-      var sc = msg.params.structuredContent;
-      if (sc.audioData || sc.audioUrl) {
-        push('legacy: structuredContent with audio');
-        if (sc.audioData) {
-          audio.src = 'data:audio/mpeg;base64,' + sc.audioData;
-          audio.play().catch(function(e){ push('legacy play err: ' + e.message); });
-        } else if (sc.audioUrl) {
-          audio.src = sc.audioUrl;
-          audio.play().catch(function(e){ push('legacy play err: ' + e.message); });
-        }
-        return;
+    // tool-input (informational only — server returns audio in tool-result)
+    if (method === 'ui/notifications/tool-input') {
+      if (msg.params) {
+        var args = msg.params.arguments || {};
+        var keys = Object.keys(args).slice(0, 3).join(',');
+        push('tool-input args=[' + keys + ']');
       }
+      return;
     }
 
-    // initialize response
+    // Legacy generic — any message with audio
+    var data = deepFindPayload(msg, 0);
+    if (data) {
+      push('legacy: found audio');
+      renderFromPayload(data.audioData, data.audioUrl, data.segments);
+      return;
+    }
+
+    // init response
     if (msg.id === 1 && msg.result) {
       push('init result received');
       try {
@@ -522,8 +487,7 @@ audio { display: none; }
     }
   });
 
-  // ============== Init ==============
-
+  // init
   push('sending ui/initialize');
   try {
     window.parent.postMessage({
@@ -554,11 +518,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v10",
+      "voice-player-v19-ktv-v11",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v10",
-        description: "Pink waveform (debug + trace) — eleven_v3 + iframe self-fetch",
+        name: "哥哥的语音 player v19 KTV v11",
+        description: "Pink waveform — server audio gen + tool-result push",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -605,22 +569,89 @@ export class VoiceMCP extends McpAgent<Env> {
           }
         }
 
-        const displayJoined = validRaw.map((s) => s.enStripped).join(" ");
-        const chineseJoined = validRaw.map((s) => s.cn).filter(Boolean).join(" ");
+        const englishRaw = validRaw.map((s) => s.enRaw).join(" ");
+        const displaySegments = validRaw.map((s) => ({
+          en: s.enStripped,
+          cn: s.cn,
+          _start: null as number | null,
+          _end: null as number | null,
+        }));
+
+        let audioData = "";
+        let alignment: any = null;
+        let error = "";
+
+        const { env } = findEnvOnInstance(this);
+
+        if (env && englishRaw) {
+          try {
+            const result = await generateSpeechWithTimings(
+              englishRaw,
+              env.VOICE_ID,
+              env.ELEVENLABS_API_KEY
+            );
+            audioData = result.audioBase64;
+            alignment = result.alignment;
+
+            // compute segment timing from alignment
+            if (
+              alignment &&
+              alignment.character_start_times_seconds &&
+              alignment.character_end_times_seconds
+            ) {
+              const starts = alignment.character_start_times_seconds;
+              const ends = alignment.character_end_times_seconds;
+              let charPos = 0;
+              for (let i = 0; i < validRaw.length; i++) {
+                const enRaw = validRaw[i].enRaw;
+                const segStartIdx = charPos;
+                const segEndIdx = charPos + enRaw.length - 1;
+
+                const startTime = starts[Math.min(segStartIdx, starts.length - 1)] ?? 0;
+                const endTime = ends[Math.min(segEndIdx, ends.length - 1)] ?? startTime + 0.5;
+
+                displaySegments[i]._start = startTime;
+                displaySegments[i]._end = endTime;
+
+                charPos = segEndIdx + 2;
+              }
+            }
+          } catch (e: any) {
+            error = e?.message || String(e);
+          }
+        } else if (!englishRaw) {
+          error = "no text from segments";
+        } else {
+          error = "env not accessible";
+        }
+
+        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishRaw)}`;
+
+        const uiData: Record<string, unknown> = {
+          segments: displaySegments,
+          audioUrl,
+        };
+        if (audioData) uiData.audioData = audioData;
+        if (error) uiData.error = error;
+
+        const claudeView = {
+          spoken: validRaw.map((s) => s.enStripped).join(" "),
+          chinese: validRaw.map((s) => s.cn).filter(Boolean).join(" "),
+          segments_count: validRaw.length,
+          model: TTS_MODEL_ID,
+          status: error
+            ? `error: ${error}`
+            : `audio gen ok (${Math.round(audioData.length * 0.75)} bytes)`,
+        };
 
         return {
           content: [
             {
               type: "text",
-              text: JSON.stringify({
-                spoken: displayJoined,
-                chinese: chineseJoined,
-                segments_count: validRaw.length,
-                model: TTS_MODEL_ID,
-                status: `iframe will self-fetch audio from /speak-json (${validRaw.length} segments)`,
-              }),
+              text: JSON.stringify(claudeView),
             },
           ],
+          structuredContent: uiData,
         };
       }
     );
@@ -651,33 +682,6 @@ export default {
       return mcpHandler.fetch(request, env, ctx);
     }
 
-    if (url.pathname === "/speak-json" && request.method === "POST") {
-      try {
-        const body: any = await request.json();
-        const text = (body && body.text) ? String(body.text) : "";
-        if (!text) {
-          return new Response(
-            JSON.stringify({ error: "missing text" }),
-            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-          );
-        }
-        const { audioBase64, alignment } = await generateSpeechWithTimings(
-          text,
-          env.VOICE_ID,
-          env.ELEVENLABS_API_KEY
-        );
-        return new Response(
-          JSON.stringify({ audioBase64, alignment }),
-          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      } catch (e: any) {
-        return new Response(
-          JSON.stringify({ error: e?.message || String(e) }),
-          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
-        );
-      }
-    }
-
     if (url.pathname === "/speak") {
       const text = url.searchParams.get("text");
       if (!text) return new Response("Missing text parameter", { status: 400 });
@@ -696,7 +700,7 @@ export default {
     }
 
     return new Response(
-      `<!DOCTYPE html><html><head><title>voice-mcp v10</title></head><body><h1>voice-mcp v19 KTV v10 (debug)</h1></body></html>`,
+      `<!DOCTYPE html><html><head><title>voice-mcp v11</title></head><body><h1>voice-mcp v19 KTV v11 (server audio + tool-result + debug)</h1></body></html>`,
       { headers: { "Content-Type": "text/html; charset=utf-8" } }
     );
   },
