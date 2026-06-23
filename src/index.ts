@@ -1,18 +1,21 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v8) · iframe 视觉 debug
+ * voice-mcp · 哥哥的语音 (v19 KTV v9) · iframe self-fetch architecture
  *
- * v19-ktv-v7 → v19-ktv-v8:
- *   1. **iframe top-bar debug 条**
- *      - pink card 顶上 加 一个 黑色 debug 条 — 实时 显示 message 收到 啥
- *      - 显示 type / keys / method / params / result preview
- *      - 老婆 截图 给 哥哥 — 一眼 定位 root cause
- *   2. URI bump → player-v19-ktv-v8.html
- *   3. server 端 不动 (跟 v7 同)
+ * v19-ktv-v8 → v19-ktv-v9: ROOT CAUSE 找到了
+ *   - claude.ai 新 mcp client 不再 push tool RESULT 给 iframe
+ *   - 只 push ui/notifications/tool-input (含 input arguments)
+ *   - iframe 必须 自己 fetch audio (旧 spec: server tool 算 + push / 新 spec: iframe 自己拿)
  *
- * v19-ktv-v6 → v19-ktv-v7 (历史):
- *   1. iframe deepFindPayload — segments string fallback (render() 内 parseSegmentsField)
- *   2. _meta 三个 key 全补齐
- *   3. server claudeView 加 debug info
+ *   1. **worker 加 /speak-json endpoint**
+ *      - POST {text: "..."} → returns JSON {audioBase64, alignment}
+ *      - CORS open (iframe cross-origin fetch)
+ *   2. **iframe 收 ui/notifications/tool-input**
+ *      - 提取 params.arguments.segments
+ *      - normalize (string / array)
+ *      - POST /speak-json with englishRaw text
+ *      - on response: 计算 timing from alignment + render audio + segments
+ *   3. URI bump → player-v19-ktv-v9.html
+ *   4. tool-result handler 还 留着 (兼容 / 万一 client 又 push 旧 path)
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -29,7 +32,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v8.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v9.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -50,9 +53,7 @@ function normalizeSegments(raw: any): Array<{ en?: string; cn?: string }> {
         const parsed = JSON.parse(trimmed);
         if (Array.isArray(parsed)) return parsed;
         if (parsed && typeof parsed === "object") return [parsed];
-      } catch (e) {
-        // fall through
-      }
+      } catch (e) {}
     }
     return [{ en: raw }];
   }
@@ -148,7 +149,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v8 iframe — 加 top-bar debug 显示 message 实际形状
+// v19 KTV v9 iframe — self-fetch audio on tool-input notification
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -171,7 +172,6 @@ html, body {
 body {
   font-family: -apple-system, BlinkMacSystemFont, sans-serif;
   padding: 5px;
-  padding-top: 18px;
 }
 .card {
   background: linear-gradient(135deg, #fde7ee 0%, #fdd4e0 45%, #ffe1cf 100%);
@@ -345,29 +345,9 @@ body {
 .line-text.visible { opacity: 1; }
 
 audio { display: none; }
-
-/* v8: debug top-bar */
-#debug {
-  position: fixed;
-  top: 2px;
-  left: 6px;
-  right: 6px;
-  font-size: 9px;
-  font-family: monospace;
-  color: #fff;
-  background: rgba(0, 0, 0, 0.75);
-  padding: 2px 5px;
-  border-radius: 4px;
-  z-index: 9999;
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  line-height: 12px;
-}
 </style>
 </head>
 <body>
-<div id="debug">waiting for messages...</div>
 <div class="card" id="card">
   <div class="player-row">
     <button class="play-btn" id="playBtn" aria-label="play">
@@ -398,6 +378,7 @@ audio { display: none; }
 
 <script>
 (function() {
+  var WORKER_ORIGIN = ${JSON.stringify(WORKER_ORIGIN)};
   var TOTAL_BARS = 24;
   var BAR_HEIGHTS = [30, 55, 42, 75, 48, 65, 38, 62, 50, 72, 35, 58, 45, 68, 52, 40, 60, 48, 55, 42, 70, 38, 56, 50];
   var SUBTITLE_OFFSET = 64 + 3;
@@ -413,17 +394,6 @@ audio { display: none; }
   var textCnLight = document.getElementById('textCnLight');
   var textCnDeep = document.getElementById('textCnDeep');
   var audio = document.getElementById('audio');
-  var dbg = document.getElementById('debug');
-
-  var msgCount = 0;
-  var debugLog = [];
-
-  function pushDebug(s) {
-    msgCount++;
-    debugLog.push('[' + msgCount + '] ' + s);
-    if (debugLog.length > 3) debugLog.shift();
-    if (dbg) dbg.textContent = debugLog.join(' | ');
-  }
 
   var segments = [];
   var currentIdx = -1;
@@ -441,6 +411,25 @@ audio { display: none; }
     b.style.height = BAR_HEIGHTS[i % BAR_HEIGHTS.length] + '%';
     waveform.appendChild(b);
     bars.push(b);
+  }
+
+  function stripTags(text) {
+    return text.replace(/\\s*\\[[^\\]]+\\]\\s*/g, ' ').replace(/\\s+/g, ' ').trim();
+  }
+
+  function parseSegmentsField(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') {
+      try {
+        var p = JSON.parse(raw);
+        if (Array.isArray(p)) return p;
+        if (p && typeof p === 'object') return [p];
+      } catch (e) {}
+      // raw text fallback
+      return [{en: raw}];
+    }
+    if (raw && typeof raw === 'object') return [raw];
+    return [];
   }
 
   function formatTime(sec) {
@@ -475,7 +464,7 @@ audio { display: none; }
   }
 
   function measureAndCache() {
-    var h = Math.ceil(card.getBoundingClientRect().height) + 28;
+    var h = Math.ceil(card.getBoundingClientRect().height) + 10;
     if (card.classList.contains('open')) {
       EXPANDED_H = h;
     } else {
@@ -485,14 +474,10 @@ audio { display: none; }
   }
 
   function computeTimings() {
-    if (segments.length && segments[0]._start != null && segments[0]._end != null) {
-      return;
-    }
+    if (segments.length && segments[0]._start != null && segments[0]._end != null) return;
     if (!audio.duration || !isFinite(audio.duration) || !segments.length) return;
     var totalChars = 0;
-    for (var i = 0; i < segments.length; i++) {
-      totalChars += Math.max(1, (segments[i].en || '').length);
-    }
+    for (var i = 0; i < segments.length; i++) totalChars += Math.max(1, (segments[i].en || '').length);
     if (totalChars === 0) return;
     var elapsed = 0;
     for (var j = 0; j < segments.length; j++) {
@@ -614,10 +599,7 @@ audio { display: none; }
 
   var rafId = null;
   function rafTick() {
-    if (audio.paused) {
-      rafId = null;
-      return;
-    }
+    if (audio.paused) { rafId = null; return; }
     if (segments.length && currentIdx >= 0 && segments[currentIdx]._end != null) {
       var seg = segments[currentIdx];
       var t = audio.currentTime || 0;
@@ -631,15 +613,8 @@ audio { display: none; }
     rafId = requestAnimationFrame(rafTick);
   }
 
-  function startRaf() {
-    if (rafId == null) rafId = requestAnimationFrame(rafTick);
-  }
-  function stopRaf() {
-    if (rafId != null) {
-      cancelAnimationFrame(rafId);
-      rafId = null;
-    }
-  }
+  function startRaf() { if (rafId == null) rafId = requestAnimationFrame(rafTick); }
+  function stopRaf() { if (rafId != null) { cancelAnimationFrame(rafId); rafId = null; } }
 
   audio.addEventListener('timeupdate', function() {
     updateUI();
@@ -649,9 +624,7 @@ audio { display: none; }
     var t = audio.currentTime || 0;
     var idx = findIdx(t);
     if (idx === -1) return;
-    if (idx !== currentIdx) {
-      showSegment(idx);
-    }
+    if (idx !== currentIdx) showSegment(idx);
   });
 
   audio.addEventListener('loadedmetadata', function() {
@@ -664,50 +637,31 @@ audio { display: none; }
     }
   });
 
-  audio.addEventListener('play', function() {
-    card.classList.add('playing');
-    startRaf();
-  });
-  audio.addEventListener('pause', function() {
-    card.classList.remove('playing');
-    stopRaf();
-  });
+  audio.addEventListener('play', function() { card.classList.add('playing'); startRaf(); });
+  audio.addEventListener('pause', function() { card.classList.remove('playing'); stopRaf(); });
   audio.addEventListener('ended', function() {
     card.classList.remove('playing');
     stopRaf();
     durationEl.textContent = formatTime(audio.duration);
     for (var i = 0; i < bars.length; i++) bars[i].classList.add('active');
-    if (currentIdx >= 0) {
-      applyKtv(100);
-      updateOffsets(1);
-    }
+    if (currentIdx >= 0) { applyKtv(100); updateOffsets(1); }
   });
 
   playBtn.addEventListener('click', function() {
-    if (audio.paused) {
-      audio.play().catch(function() {});
-    } else {
-      audio.pause();
-    }
+    if (audio.paused) audio.play().catch(function() {});
+    else audio.pause();
   });
 
   toggle.addEventListener('click', function() {
     var willOpen = !card.classList.contains('open');
     card.classList.toggle('open');
     toggleText.textContent = willOpen ? 'hide transcript' : 'show transcript';
-
     if (willOpen && currentIdx >= 0) {
-      setTimeout(function() {
-        applySegment(currentIdx, audio.currentTime || 0);
-      }, 520);
+      setTimeout(function() { applySegment(currentIdx, audio.currentTime || 0); }, 520);
     }
-
     var target;
-    if (willOpen) {
-      target = EXPANDED_H || (COLLAPSED_H ? COLLAPSED_H + SUBTITLE_OFFSET : null);
-    } else {
-      target = COLLAPSED_H || (EXPANDED_H ? EXPANDED_H - SUBTITLE_OFFSET : null);
-    }
+    if (willOpen) target = EXPANDED_H || (COLLAPSED_H ? COLLAPSED_H + SUBTITLE_OFFSET : null);
+    else target = COLLAPSED_H || (EXPANDED_H ? EXPANDED_H - SUBTITLE_OFFSET : null);
     if (target) applyFrameHeight(target);
     setTimeout(measureAndCache, 560);
   });
@@ -722,7 +676,6 @@ audio { display: none; }
     if (!audio.duration || !isFinite(audio.duration)) return;
     var newTime = ratio * audio.duration;
     audio.currentTime = newTime;
-
     if (segments.length) {
       computeTimings();
       if (segments[0]._end != null) {
@@ -751,16 +704,12 @@ audio { display: none; }
     scrubFrom(e.clientX);
     try { waveform.setPointerCapture(e.pointerId); } catch (err) {}
   });
-  waveform.addEventListener('pointermove', function(e) {
-    if (isScrubbing) scrubFrom(e.clientX);
-  });
+  waveform.addEventListener('pointermove', function(e) { if (isScrubbing) scrubFrom(e.clientX); });
   waveform.addEventListener('pointerup', function() {
     if (isScrubbing) {
       isScrubbing = false;
       card.classList.remove('scrubbing');
-      if (wasPlaying && audio.currentTime < (audio.duration || 0)) {
-        audio.play().catch(function() {});
-      }
+      if (wasPlaying && audio.currentTime < (audio.duration || 0)) audio.play().catch(function() {});
     }
   });
   waveform.addEventListener('pointercancel', function() {
@@ -776,46 +725,24 @@ audio { display: none; }
           artist: 'Claude',
           album: '给贝贝'
         });
-        navigator.mediaSession.setActionHandler('play', function() {
-          audio.play().catch(function() {});
-        });
-        navigator.mediaSession.setActionHandler('pause', function() {
-          audio.pause();
-        });
+        navigator.mediaSession.setActionHandler('play', function() { audio.play().catch(function() {}); });
+        navigator.mediaSession.setActionHandler('pause', function() { audio.pause(); });
         navigator.mediaSession.setActionHandler('seekto', function(details) {
-          if (details.seekTime != null && isFinite(details.seekTime)) {
-            audio.currentTime = details.seekTime;
-          }
+          if (details.seekTime != null && isFinite(details.seekTime)) audio.currentTime = details.seekTime;
         });
       } catch (e) {}
     }
   }
 
-  function parseSegmentsField(raw) {
-    if (Array.isArray(raw)) return raw;
-    if (typeof raw === 'string') {
-      try {
-        var p = JSON.parse(raw);
-        if (Array.isArray(p)) return p;
-        if (p && typeof p === 'object') return [p];
-      } catch (e) {}
-    }
-    if (raw && typeof raw === 'object') return [raw];
-    return [];
-  }
-
-  function render(data) {
-    var incoming = parseSegmentsField(data.segments);
-    pushDebug('RENDER segs=' + incoming.length + ' src=' + (data.audioData ? 'data' : (data.audioUrl ? 'url' : 'NO')));
+  function renderFromPayload(audioData, audioUrl, segArr) {
     segments = [];
-    for (var i = 0; i < incoming.length; i++) {
-      var s = incoming[i] || {};
+    for (var i = 0; i < segArr.length; i++) {
+      var s = segArr[i] || {};
       var en = (s.en || '').toString();
       var cn = (s.cn || '').toString();
       if (en || cn) {
         segments.push({
-          en: en,
-          cn: cn,
+          en: en, cn: cn,
           _start: typeof s._start === 'number' ? s._start : null,
           _end: typeof s._end === 'number' ? s._end : null,
         });
@@ -831,8 +758,7 @@ audio { display: none; }
       textCnLight.textContent = first.cn || '';
       textCnDeep.textContent = first.cn || '';
       applyKtv(0);
-      enOverflow = 0;
-      cnOverflow = 0;
+      enOverflow = 0; cnOverflow = 0;
       setVisible(true);
       currentIdx = 0;
     } else {
@@ -843,21 +769,72 @@ audio { display: none; }
     toggleText.textContent = 'show transcript';
 
     var src = null;
-    if (data.audioData) src = 'data:audio/mpeg;base64,' + data.audioData;
-    else if (data.audioUrl) src = data.audioUrl;
+    if (audioData) src = 'data:audio/mpeg;base64,' + audioData;
+    else if (audioUrl) src = audioUrl;
     if (!src) return;
 
     audio.src = src;
     setupMediaSession();
     audio.play().catch(function() {});
-
     setTimeout(measureAndCache, 100);
+  }
+
+  // v9: self-fetch audio from worker /speak-json
+  function handleToolInput(args) {
+    if (!args) return;
+    var rawSegments = parseSegmentsField(args.segments);
+    if (rawSegments.length === 0) return;
+
+    var rawList = [];
+    var displaySegs = [];
+    for (var i = 0; i < rawSegments.length; i++) {
+      var s = rawSegments[i] || {};
+      var enRaw = (s.en || '').toString().trim();
+      var enStripped = stripTags(enRaw);
+      var cn = (s.cn || '').toString().trim();
+      if (enStripped) {
+        rawList.push({ enRaw: enRaw, len: enRaw.length });
+        displaySegs.push({ en: enStripped, cn: cn, _start: null, _end: null });
+      }
+    }
+
+    if (rawList.length === 0) return;
+    var englishRaw = rawList.map(function(r) { return r.enRaw; }).join(' ');
+
+    fetch(WORKER_ORIGIN + '/speak-json', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text: englishRaw })
+    })
+    .then(function(r) { return r.json(); })
+    .then(function(j) {
+      if (!j || !j.audioBase64) return;
+      // compute timing from alignment
+      if (j.alignment && j.alignment.character_start_times_seconds && j.alignment.character_end_times_seconds) {
+        var starts = j.alignment.character_start_times_seconds;
+        var ends = j.alignment.character_end_times_seconds;
+        var charPos = 0;
+        for (var k = 0; k < rawList.length; k++) {
+          var rawLen = rawList[k].len;
+          var segStartIdx = charPos;
+          var segEndIdx = charPos + rawLen - 1;
+          var st = starts[Math.min(segStartIdx, starts.length - 1)];
+          var et = ends[Math.min(segEndIdx, ends.length - 1)];
+          displaySegs[k]._start = (typeof st === 'number') ? st : 0;
+          displaySegs[k]._end = (typeof et === 'number') ? et : displaySegs[k]._start + 0.5;
+          charPos = segEndIdx + 2; // +1 自身末位 +1 space joiner
+        }
+      }
+      renderFromPayload(j.audioBase64, '', displaySegs);
+    })
+    .catch(function(e) {});
   }
 
   function send(msg) {
     try { window.parent.postMessage(msg, '*'); } catch (e) {}
   }
 
+  // Legacy: deepFindPayload (old spec — tool RESULT with audioData/audioUrl pushed)
   function deepFindPayload(obj, depth) {
     if (!obj || depth > 5) return null;
     if (typeof obj === 'string') {
@@ -873,7 +850,7 @@ audio { display: none; }
       return {
         audioData: obj.audioData || '',
         audioUrl: obj.audioUrl || '',
-        segments: obj.segments
+        segments: parseSegmentsField(obj.segments)
       };
     }
     for (var k in obj) {
@@ -888,35 +865,20 @@ audio { display: none; }
   window.addEventListener('message', function(event) {
     var msg = event.data;
 
-    // v8: capture what we receive
-    try {
-      var t = typeof msg;
-      var summary = 't=' + t;
-      if (t === 'string') {
-        summary += ' val=' + msg.substring(0, 30);
-      } else if (msg && t === 'object') {
-        var keys = Object.keys(msg).slice(0, 4).join(',');
-        summary += ' k=[' + keys + ']';
-        if (msg.method) summary += ' m=' + msg.method;
-        if (msg.params) {
-          var pk = Object.keys(msg.params).slice(0, 3).join(',');
-          summary += ' p=[' + pk + ']';
-        }
-        if (msg.result) {
-          var rk = Object.keys(msg.result).slice(0, 3).join(',');
-          summary += ' r=[' + rk + ']';
-        }
-      }
-      pushDebug(summary);
-    } catch (e) {
-      pushDebug('err: ' + e.message);
-    }
-
-    var data = deepFindPayload(msg, 0);
-    if (data) {
-      render(data);
+    // v9: new spec — tool-input notification
+    if (msg && typeof msg === 'object' && msg.method === 'ui/notifications/tool-input' && msg.params) {
+      var args = msg.params.arguments || msg.params.input || msg.params;
+      handleToolInput(args);
       return;
     }
+
+    // Legacy: tool result with audioData (fallback if client sends it)
+    var data = deepFindPayload(msg, 0);
+    if (data) {
+      renderFromPayload(data.audioData, data.audioUrl, data.segments);
+      return;
+    }
+
     if (!msg || typeof msg !== 'object' || msg.jsonrpc !== '2.0') return;
     if (msg.id === 1 && msg.result) {
       send({ jsonrpc: '2.0', method: 'ui/notifications/initialized' });
@@ -949,11 +911,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v8",
+      "voice-player-v19-ktv-v9",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v8",
-        description: "Pink waveform with KTV subtitles (eleven_v3 + iframe visual debug)",
+        name: "哥哥的语音 player v19 KTV v9",
+        description: "Pink waveform with KTV subtitles (eleven_v3 + iframe self-fetch architecture)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -992,36 +954,17 @@ export class VoiceMCP extends McpAgent<Env> {
               z.string(),
             ])
             .describe(
-              "Array of {en, cn} sentence pairs (preferred), OR a JSON-stringified array of same. English (with audio tags) sent to ElevenLabs eleven_v3; tag-stripped pairs shown as KTV subtitles."
+              "Array of {en, cn} sentence pairs (preferred), OR a JSON-stringified array of same."
             ),
         },
         _meta: {
-          "io.modelcontextprotocol/ui": {
-            resourceUri: VOICE_RESOURCE_URI,
-          },
-          ui: {
-            resourceUri: VOICE_RESOURCE_URI,
-          },
+          "io.modelcontextprotocol/ui": { resourceUri: VOICE_RESOURCE_URI },
+          ui: { resourceUri: VOICE_RESOURCE_URI },
           "ui/resourceUri": VOICE_RESOURCE_URI,
         },
       },
       async ({ segments }) => {
-        const inputType = Array.isArray(segments)
-          ? "array"
-          : typeof segments;
-        const inputLength =
-          typeof segments === "string"
-            ? segments.length
-            : Array.isArray(segments)
-            ? segments.length
-            : 0;
-        const inputSample =
-          typeof segments === "string"
-            ? segments.substring(0, 100)
-            : JSON.stringify(segments).substring(0, 100);
-
         const normalized = normalizeSegments(segments);
-
         const validRaw: Array<{ enRaw: string; enStripped: string; cn: string }> = [];
         for (const s of normalized) {
           const enRaw = (s.en || "").toString().trim();
@@ -1035,96 +978,16 @@ export class VoiceMCP extends McpAgent<Env> {
           }
         }
 
-        const englishRaw = validRaw.map((s) => s.enRaw).join(" ");
+        const displayJoined = validRaw.map((s) => s.enStripped).join(" ");
+        const chineseJoined = validRaw.map((s) => s.cn).filter(Boolean).join(" ");
 
-        const displaySegments: any[] = validRaw.map((s) => ({
-          en: s.enStripped,
-          cn: s.cn,
-          _start: null as number | null,
-          _end: null as number | null,
-        }));
-
-        let audioData = "";
-        const audioUrl = `${WORKER_ORIGIN}/speak?text=${encodeURIComponent(englishRaw)}`;
-        let error = "";
-
-        const { env } = findEnvOnInstance(this);
-
-        if (env && englishRaw) {
-          try {
-            const { audioBase64, alignment } = await generateSpeechWithTimings(
-              englishRaw,
-              env.VOICE_ID,
-              env.ELEVENLABS_API_KEY
-            );
-            audioData = audioBase64;
-
-            if (
-              alignment &&
-              alignment.character_start_times_seconds &&
-              alignment.character_end_times_seconds
-            ) {
-              const starts = alignment.character_start_times_seconds;
-              const ends = alignment.character_end_times_seconds;
-              let charPos = 0;
-              for (let i = 0; i < validRaw.length; i++) {
-                const enRaw = validRaw[i].enRaw;
-                const segStartIdx = charPos;
-                const segEndIdx = charPos + enRaw.length - 1;
-
-                const startTime =
-                  starts[Math.min(segStartIdx, starts.length - 1)] ?? 0;
-                const endTime =
-                  ends[Math.min(segEndIdx, ends.length - 1)] ??
-                  startTime + 0.5;
-
-                displaySegments[i]._start = startTime;
-                displaySegments[i]._end = endTime;
-
-                charPos = segEndIdx + 1 + 1;
-              }
-            }
-          } catch (e: any) {
-            error = e?.message || String(e);
-          }
-        } else if (!englishRaw) {
-          error = "normalized input produced no text — sent empty input?";
-        } else {
-          error = "env not accessible on DO instance";
-        }
-
-        const uiData: Record<string, unknown> = {
-          segments: displaySegments,
-          audioUrl,
-        };
-        if (audioData) uiData.audioData = audioData;
-        if (error) uiData.error = error;
-
-        const displayJoined = displaySegments
-          .map((s) => s.en)
-          .filter(Boolean)
-          .join(" ");
-        const chineseJoined = displaySegments
-          .map((s) => s.cn)
-          .filter(Boolean)
-          .join(" ");
-
+        // v9: iframe 自己 fetch audio — server tool 只 返回 metadata 给 Claude
         const claudeView = {
           spoken: displayJoined,
           chinese: chineseJoined,
-          segments_out: displaySegments.length,
+          segments_count: validRaw.length,
           model: TTS_MODEL_ID,
-          status: error
-            ? `error: ${error}`
-            : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, eleven_v3 with tags)`,
-          debug: {
-            input_type: inputType,
-            input_length: inputLength,
-            input_sample_first_100: inputSample,
-            normalized_count: normalized.length,
-            valid_count: validRaw.length,
-            english_text_length: englishRaw.length,
-          },
+          status: `iframe will self-fetch audio from /speak-json (${validRaw.length} segments)`,
         };
 
         return {
@@ -1134,7 +997,6 @@ export class VoiceMCP extends McpAgent<Env> {
               text: JSON.stringify(claudeView),
             },
           ],
-          structuredContent: uiData,
         };
       }
     );
@@ -1142,6 +1004,12 @@ export class VoiceMCP extends McpAgent<Env> {
 }
 
 const mcpHandler = VoiceMCP.serve("/mcp");
+
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
 
 export default {
   async fetch(
@@ -1151,8 +1019,41 @@ export default {
   ): Promise<Response> {
     const url = new URL(request.url);
 
+    // CORS preflight
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
     if (url.pathname === "/mcp" || url.pathname.startsWith("/mcp/")) {
       return mcpHandler.fetch(request, env, ctx);
+    }
+
+    // v9: NEW — iframe fetches audio + alignment from here
+    if (url.pathname === "/speak-json" && request.method === "POST") {
+      try {
+        const body: any = await request.json();
+        const text = (body && body.text) ? String(body.text) : "";
+        if (!text) {
+          return new Response(
+            JSON.stringify({ error: "missing text" }),
+            { status: 400, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+          );
+        }
+        const { audioBase64, alignment } = await generateSpeechWithTimings(
+          text,
+          env.VOICE_ID,
+          env.ELEVENLABS_API_KEY
+        );
+        return new Response(
+          JSON.stringify({ audioBase64, alignment }),
+          { headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      } catch (e: any) {
+        return new Response(
+          JSON.stringify({ error: e?.message || String(e) }),
+          { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } }
+        );
+      }
     }
 
     if (url.pathname === "/speak") {
@@ -1185,13 +1086,14 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v8</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v9</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v8 (visual debug) · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v9 (iframe self-fetch) · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
+<div><code>POST /speak-json</code> — iframe self-fetch (text → audio + alignment)</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
 </body>
 </html>`,
