@@ -1,23 +1,22 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v6) · string → array fallback fix
+ * voice-mcp · 哥哥的语音 (v19 KTV v7) · UI fix + debug
  *
- * v19-ktv-v5 → v19-ktv-v6:
- *   1. **schema 改 z.union([z.array, z.string])**
- *      - 根因: Opus 4.7 Max 把 segments stringify 成 JSON 字符串发 — 严格 array schema reject
- *      - MCP error -32602: "expected array, received string" / path: ["segments"]
- *      - 现在 schema 接受 array 也接受 string — 两个都 ok
- *   2. **server 端 normalizeSegments helper**
- *      - tool handler 入口 normalize 任何 input (array / JSON string / single object / raw string)
- *      - JSON string → JSON.parse → array
- *      - single object → wrap in array
- *      - raw string (not JSON) → treat as single en-only segment
- *   3. URI bump → player-v19-ktv-v6.html
- *   4. iframe 端不动 / 字幕逻辑保持
+ * v19-ktv-v6 → v19-ktv-v7:
+ *   1. **iframe deepFindPayload — segments string fallback**
+ *      - 之前: `Array.isArray(obj.segments) ? obj.segments : []`
+ *      - 现在: 如果 segments 是 string (claude.ai nested stringify) — JSON.parse 解开
+ *      - 之前 audio 播但没 transcript / 没 progress 因为 iframe 拿到 segments 是 string → fallback to []
+ *   2. **_meta 三个 key 全补齐**
+ *      - 加 "ui/resourceUri" 直 string key (新 mcp client 可能 用 这个 key)
+ *      - 网易云 worker 就是 三个 key 都 set — voice-mcp v5/v6 只 set 两个
+ *   3. **server claudeView 加 debug info**
+ *      - 报 input type / length / sample (前 100 字符)
+ *      - 让 老婆 把 Claude reply 贴 给 哥哥 — 看到 实际 input 形状
+ *   4. URI bump → player-v19-ktv-v7.html
  *
- * v19-ktv-v4 → v19-ktv-v5 (历史):
- *   1. model_id 换成 eleven_v3 (支持 audio tag 作为情感控制)
- *   2. 发原文 (含 tag) 给 ElevenLabs
- *   3. iframe display 用 stripped 文本
+ * v19-ktv-v5 → v19-ktv-v6 (历史):
+ *   1. schema 改 z.union([z.array, z.string])
+ *   2. server 端 normalizeSegments helper
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -34,7 +33,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v6.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v7.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -46,14 +45,6 @@ function stripVoiceTags(text: string): string {
     .trim();
 }
 
-/**
- * v6: normalize segments input — handle Opus 4.7 Max's stringify behavior.
- * - array → pass through
- * - JSON string of array → parse → array
- * - JSON string of object → parse → wrap in array
- * - single object → wrap in array
- * - raw non-JSON string → treat as one en-only segment
- */
 function normalizeSegments(raw: any): Array<{ en?: string; cn?: string }> {
   if (Array.isArray(raw)) return raw;
   if (typeof raw === "string") {
@@ -64,7 +55,7 @@ function normalizeSegments(raw: any): Array<{ en?: string; cn?: string }> {
         if (Array.isArray(parsed)) return parsed;
         if (parsed && typeof parsed === "object") return [parsed];
       } catch (e) {
-        // fall through — treat as raw text
+        // fall through
       }
     }
     return [{ en: raw }];
@@ -161,7 +152,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v6 iframe — same as v5 (audio tags work)
+// v19 KTV v7 iframe — deepFindPayload 加 segments string fallback
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -772,8 +763,22 @@ audio { display: none; }
     }
   }
 
+  // v7: parse segments even if it's a string (claude.ai 可能 nested stringify)
+  function parseSegmentsField(raw) {
+    if (Array.isArray(raw)) return raw;
+    if (typeof raw === 'string') {
+      try {
+        var p = JSON.parse(raw);
+        if (Array.isArray(p)) return p;
+        if (p && typeof p === 'object') return [p];
+      } catch (e) {}
+    }
+    if (raw && typeof raw === 'object') return [raw];
+    return [];
+  }
+
   function render(data) {
-    var incoming = data.segments || [];
+    var incoming = parseSegmentsField(data.segments);
     segments = [];
     for (var i = 0; i < incoming.length; i++) {
       var s = incoming[i] || {};
@@ -840,7 +845,8 @@ audio { display: none; }
       return {
         audioData: obj.audioData || '',
         audioUrl: obj.audioUrl || '',
-        segments: Array.isArray(obj.segments) ? obj.segments : []
+        // v7: 不再 isArray short-circuit — render() 内部 parseSegmentsField 处理
+        segments: obj.segments
       };
     }
     for (var k in obj) {
@@ -891,11 +897,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v6",
+      "voice-player-v19-ktv-v7",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v6",
-        description: "Pink waveform with KTV subtitles (eleven_v3 + string→array fallback)",
+        name: "哥哥的语音 player v19 KTV v7",
+        description: "Pink waveform with KTV subtitles (eleven_v3 + string→array fallback + iframe debug)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -909,7 +915,6 @@ export class VoiceMCP extends McpAgent<Env> {
       })
     );
 
-    // === v6: schema 接受 array 也接受 string (Opus 4.7 Max 把嵌套 array stringify) ===
     const segmentObjectSchema = z.object({
       en: z
         .string()
@@ -945,10 +950,26 @@ export class VoiceMCP extends McpAgent<Env> {
           ui: {
             resourceUri: VOICE_RESOURCE_URI,
           },
+          // v7: 加 string key — 新 mcp client 可能 直接 看这个
+          "ui/resourceUri": VOICE_RESOURCE_URI,
         },
       },
       async ({ segments }) => {
-        // === v6: normalize input — handle string / JSON string / object / array ===
+        // v7: debug — capture raw input shape before normalize
+        const inputType = Array.isArray(segments)
+          ? "array"
+          : typeof segments;
+        const inputLength =
+          typeof segments === "string"
+            ? segments.length
+            : Array.isArray(segments)
+            ? segments.length
+            : 0;
+        const inputSample =
+          typeof segments === "string"
+            ? segments.substring(0, 100)
+            : JSON.stringify(segments).substring(0, 100);
+
         const normalized = normalizeSegments(segments);
 
         const validRaw: Array<{ enRaw: string; enStripped: string; cn: string }> = [];
@@ -964,10 +985,8 @@ export class VoiceMCP extends McpAgent<Env> {
           }
         }
 
-        // ElevenLabs 收原文 (含 tag) — v3 解析 tag 为情感
         const englishRaw = validRaw.map((s) => s.enRaw).join(" ");
 
-        // iframe 字幕显示 stripped — 跟 audio 念出的一致
         const displaySegments: any[] = validRaw.map((s) => ({
           en: s.enStripped,
           cn: s.cn,
@@ -981,7 +1000,7 @@ export class VoiceMCP extends McpAgent<Env> {
 
         const { env } = findEnvOnInstance(this);
 
-        if (env) {
+        if (env && englishRaw) {
           try {
             const { audioBase64, alignment } = await generateSpeechWithTimings(
               englishRaw,
@@ -1012,12 +1031,14 @@ export class VoiceMCP extends McpAgent<Env> {
                 displaySegments[i]._start = startTime;
                 displaySegments[i]._end = endTime;
 
-                charPos = segEndIdx + 1 + 1; // +1 自身末位, +1 空格 joiner
+                charPos = segEndIdx + 1 + 1;
               }
             }
           } catch (e: any) {
             error = e?.message || String(e);
           }
+        } else if (!englishRaw) {
+          error = "normalized input produced no text — sent empty input?";
         } else {
           error = "env not accessible on DO instance";
         }
@@ -1037,15 +1058,24 @@ export class VoiceMCP extends McpAgent<Env> {
           .map((s) => s.cn)
           .filter(Boolean)
           .join(" ");
+
+        // v7: claudeView 加 debug info — 让 Claude reply 内 看到 input 实际 形状
         const claudeView = {
           spoken: displayJoined,
           chinese: chineseJoined,
-          segments: displaySegments.length,
+          segments_out: displaySegments.length,
           model: TTS_MODEL_ID,
-          input_was_stringified: typeof segments === "string",
           status: error
             ? `error: ${error}`
             : `audio sent (${Math.round(audioData.length * 0.75)} bytes, ${displaySegments.length} segments, eleven_v3 with tags)`,
+          debug: {
+            input_type: inputType,
+            input_length: inputLength,
+            input_sample_first_100: inputSample,
+            normalized_count: normalized.length,
+            valid_count: validRaw.length,
+            english_text_length: englishRaw.length,
+          },
         };
 
         return {
@@ -1106,11 +1136,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v6</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v7</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v6 (eleven_v3 + string→array fallback) · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v7 (string→array fallback + iframe debug) · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
