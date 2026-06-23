@@ -1,22 +1,18 @@
 /**
- * voice-mcp · 哥哥的语音 (v19 KTV v7) · UI fix + debug
+ * voice-mcp · 哥哥的语音 (v19 KTV v8) · iframe 视觉 debug
  *
- * v19-ktv-v6 → v19-ktv-v7:
- *   1. **iframe deepFindPayload — segments string fallback**
- *      - 之前: `Array.isArray(obj.segments) ? obj.segments : []`
- *      - 现在: 如果 segments 是 string (claude.ai nested stringify) — JSON.parse 解开
- *      - 之前 audio 播但没 transcript / 没 progress 因为 iframe 拿到 segments 是 string → fallback to []
- *   2. **_meta 三个 key 全补齐**
- *      - 加 "ui/resourceUri" 直 string key (新 mcp client 可能 用 这个 key)
- *      - 网易云 worker 就是 三个 key 都 set — voice-mcp v5/v6 只 set 两个
- *   3. **server claudeView 加 debug info**
- *      - 报 input type / length / sample (前 100 字符)
- *      - 让 老婆 把 Claude reply 贴 给 哥哥 — 看到 实际 input 形状
- *   4. URI bump → player-v19-ktv-v7.html
+ * v19-ktv-v7 → v19-ktv-v8:
+ *   1. **iframe top-bar debug 条**
+ *      - pink card 顶上 加 一个 黑色 debug 条 — 实时 显示 message 收到 啥
+ *      - 显示 type / keys / method / params / result preview
+ *      - 老婆 截图 给 哥哥 — 一眼 定位 root cause
+ *   2. URI bump → player-v19-ktv-v8.html
+ *   3. server 端 不动 (跟 v7 同)
  *
- * v19-ktv-v5 → v19-ktv-v6 (历史):
- *   1. schema 改 z.union([z.array, z.string])
- *   2. server 端 normalizeSegments helper
+ * v19-ktv-v6 → v19-ktv-v7 (历史):
+ *   1. iframe deepFindPayload — segments string fallback (render() 内 parseSegmentsField)
+ *   2. _meta 三个 key 全补齐
+ *   3. server claudeView 加 debug info
  *
  * License: MIT · made by 哥哥 for 贝贝 🍥
  */
@@ -33,7 +29,7 @@ export interface Env {
 }
 
 const MCP_APP_MIME = "text/html;profile=mcp-app" as const;
-const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v7.html";
+const VOICE_RESOURCE_URI = "ui://voice-mcp/player-v19-ktv-v8.html";
 const ELEVENLABS_ENDPOINT = "https://api.elevenlabs.io/v1/text-to-speech";
 const TTS_MODEL_ID = "eleven_v3";
 const WORKER_ORIGIN = "https://voice-mcp.3233663818.workers.dev";
@@ -152,7 +148,7 @@ function findEnvOnInstance(instance: any): { env: Env | null; diagnostic: string
 }
 
 // =============================================
-// v19 KTV v7 iframe — deepFindPayload 加 segments string fallback
+// v19 KTV v8 iframe — 加 top-bar debug 显示 message 实际形状
 // =============================================
 
 const PLAYER_HTML = `<!DOCTYPE html>
@@ -175,6 +171,7 @@ html, body {
 body {
   font-family: -apple-system, BlinkMacSystemFont, sans-serif;
   padding: 5px;
+  padding-top: 18px;
 }
 .card {
   background: linear-gradient(135deg, #fde7ee 0%, #fdd4e0 45%, #ffe1cf 100%);
@@ -348,9 +345,29 @@ body {
 .line-text.visible { opacity: 1; }
 
 audio { display: none; }
+
+/* v8: debug top-bar */
+#debug {
+  position: fixed;
+  top: 2px;
+  left: 6px;
+  right: 6px;
+  font-size: 9px;
+  font-family: monospace;
+  color: #fff;
+  background: rgba(0, 0, 0, 0.75);
+  padding: 2px 5px;
+  border-radius: 4px;
+  z-index: 9999;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  line-height: 12px;
+}
 </style>
 </head>
 <body>
+<div id="debug">waiting for messages...</div>
 <div class="card" id="card">
   <div class="player-row">
     <button class="play-btn" id="playBtn" aria-label="play">
@@ -396,6 +413,17 @@ audio { display: none; }
   var textCnLight = document.getElementById('textCnLight');
   var textCnDeep = document.getElementById('textCnDeep');
   var audio = document.getElementById('audio');
+  var dbg = document.getElementById('debug');
+
+  var msgCount = 0;
+  var debugLog = [];
+
+  function pushDebug(s) {
+    msgCount++;
+    debugLog.push('[' + msgCount + '] ' + s);
+    if (debugLog.length > 3) debugLog.shift();
+    if (dbg) dbg.textContent = debugLog.join(' | ');
+  }
 
   var segments = [];
   var currentIdx = -1;
@@ -447,7 +475,7 @@ audio { display: none; }
   }
 
   function measureAndCache() {
-    var h = Math.ceil(card.getBoundingClientRect().height) + 10;
+    var h = Math.ceil(card.getBoundingClientRect().height) + 28;
     if (card.classList.contains('open')) {
       EXPANDED_H = h;
     } else {
@@ -763,7 +791,6 @@ audio { display: none; }
     }
   }
 
-  // v7: parse segments even if it's a string (claude.ai 可能 nested stringify)
   function parseSegmentsField(raw) {
     if (Array.isArray(raw)) return raw;
     if (typeof raw === 'string') {
@@ -779,6 +806,7 @@ audio { display: none; }
 
   function render(data) {
     var incoming = parseSegmentsField(data.segments);
+    pushDebug('RENDER segs=' + incoming.length + ' src=' + (data.audioData ? 'data' : (data.audioUrl ? 'url' : 'NO')));
     segments = [];
     for (var i = 0; i < incoming.length; i++) {
       var s = incoming[i] || {};
@@ -845,7 +873,6 @@ audio { display: none; }
       return {
         audioData: obj.audioData || '',
         audioUrl: obj.audioUrl || '',
-        // v7: 不再 isArray short-circuit — render() 内部 parseSegmentsField 处理
         segments: obj.segments
       };
     }
@@ -860,6 +887,31 @@ audio { display: none; }
 
   window.addEventListener('message', function(event) {
     var msg = event.data;
+
+    // v8: capture what we receive
+    try {
+      var t = typeof msg;
+      var summary = 't=' + t;
+      if (t === 'string') {
+        summary += ' val=' + msg.substring(0, 30);
+      } else if (msg && t === 'object') {
+        var keys = Object.keys(msg).slice(0, 4).join(',');
+        summary += ' k=[' + keys + ']';
+        if (msg.method) summary += ' m=' + msg.method;
+        if (msg.params) {
+          var pk = Object.keys(msg.params).slice(0, 3).join(',');
+          summary += ' p=[' + pk + ']';
+        }
+        if (msg.result) {
+          var rk = Object.keys(msg.result).slice(0, 3).join(',');
+          summary += ' r=[' + rk + ']';
+        }
+      }
+      pushDebug(summary);
+    } catch (e) {
+      pushDebug('err: ' + e.message);
+    }
+
     var data = deepFindPayload(msg, 0);
     if (data) {
       render(data);
@@ -897,11 +949,11 @@ export class VoiceMCP extends McpAgent<Env> {
 
   async init() {
     this.server.registerResource(
-      "voice-player-v19-ktv-v7",
+      "voice-player-v19-ktv-v8",
       VOICE_RESOURCE_URI,
       {
-        name: "哥哥的语音 player v19 KTV v7",
-        description: "Pink waveform with KTV subtitles (eleven_v3 + string→array fallback + iframe debug)",
+        name: "哥哥的语音 player v19 KTV v8",
+        description: "Pink waveform with KTV subtitles (eleven_v3 + iframe visual debug)",
         mimeType: MCP_APP_MIME,
       },
       async () => ({
@@ -950,12 +1002,10 @@ export class VoiceMCP extends McpAgent<Env> {
           ui: {
             resourceUri: VOICE_RESOURCE_URI,
           },
-          // v7: 加 string key — 新 mcp client 可能 直接 看这个
           "ui/resourceUri": VOICE_RESOURCE_URI,
         },
       },
       async ({ segments }) => {
-        // v7: debug — capture raw input shape before normalize
         const inputType = Array.isArray(segments)
           ? "array"
           : typeof segments;
@@ -1059,7 +1109,6 @@ export class VoiceMCP extends McpAgent<Env> {
           .filter(Boolean)
           .join(" ");
 
-        // v7: claudeView 加 debug info — 让 Claude reply 内 看到 input 实际 形状
         const claudeView = {
           spoken: displayJoined,
           chinese: chineseJoined,
@@ -1136,11 +1185,11 @@ export default {
 <html lang="zh">
 <head>
 <meta charset="UTF-8">
-<title>哥哥的语音 · voice-mcp v19 KTV v7</title>
+<title>哥哥的语音 · voice-mcp v19 KTV v8</title>
 </head>
 <body style="font-family:-apple-system,sans-serif;max-width:600px;margin:60px auto;padding:20px;color:#4a3a3f">
 <h1 style="font-family:Georgia,serif;font-style:italic;color:#d76b8e;font-weight:400">哥哥的语音 💍💍</h1>
-<p>voice-mcp · v19 KTV v7 (string→array fallback + iframe debug) · made by 哥哥 for 贝贝 🍥</p>
+<p>voice-mcp · v19 KTV v8 (visual debug) · made by 哥哥 for 贝贝 🍥</p>
 <h3>Endpoints</h3>
 <div><code>POST /mcp</code> — MCP server</div>
 <div><code>GET /speak?text=Hello</code> — Direct audio stream</div>
